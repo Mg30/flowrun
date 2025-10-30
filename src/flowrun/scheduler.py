@@ -12,15 +12,23 @@ from flowrun.task import TaskRegistry
 
 @dataclass
 class SchedulerConfig:
+    """Configuration for the Scheduler.
+
+    Attributes:
+        max_parallel (int): Global cap for the number of tasks that may run concurrently.
+        Future: Notes about planned features such as per-key caps and prioritization.
+    """
+
     max_parallel: int = 4  # global cap
-    # Future: per-key caps, prioritization, etc.
 
 
 class Scheduler:
-    """
-    SRP: decide what to run next, launch it, and update state.
-    It does NOT know how to build DAG, and it does NOT define tasks.
-    Each task is executed at most once per DAG run; failures are terminal.
+    """Schedule and execute tasks in a DAG while enforcing dependency and concurrency rules.
+
+    The Scheduler coordinates runs of a DAG by creating a run record in the StateStore,
+    scheduling tasks whose dependencies are satisfied, invoking the TaskExecutor to run
+    task specs obtained from the TaskRegistry, and updating task states (SUCCESS, FAILED,
+    SKIPPED, etc.). It also enforces a global concurrency cap provided by SchedulerConfig.
     """
 
     def __init__(
@@ -36,6 +44,11 @@ class Scheduler:
         self._executor = executor
         self._cfg = config
 
+    @property
+    def executor(self) -> TaskExecutor:
+        """Return the task executor used to run individual task specs."""
+        return self._executor
+
     async def run_dag_once(self, dag: DAG, context: RunContext[Any] | None = None) -> str:
         """Execute a DAG once, tracking task state and returning the run id."""
         run_id = str(uuid.uuid4())
@@ -50,7 +63,7 @@ class Scheduler:
                 if node_state.status == "PENDING" and task_name not in inflight:
                     if self._deps_success(run_id, dag, task_name):
                         if len(inflight) < self._cfg.max_parallel:
-                            inflight[task_name] = self._launch_task(run_id, task_name, context)
+                            inflight[task_name] = self._launch_task(run_id, dag, task_name, context)
 
             if not inflight:
                 # no tasks running and nothing eligible -> we are done
@@ -92,15 +105,27 @@ class Scheduler:
     def _launch_task(
         self,
         run_id: str,
+        dag: DAG,
         task_name: str,
         context: RunContext[Any] | None,
     ) -> asyncio.Task:
         spec = self._registry.get(task_name)
+        runrec = self._state.get_run(run_id)
+        upstream_results = {
+            parent: runrec.tasks[parent].result
+            for parent in dag.parents_of(task_name)
+            if runrec.tasks[parent].status == "SUCCESS"
+        }
         # mark running before execution
         self._state.mark_running(run_id, task_name)
 
         async def _runner():
-            exec_res = await self._executor.run_once(spec, spec.timeout_s, context)
+            exec_res = await self._executor.run_once(
+                spec,
+                spec.timeout_s,
+                context,
+                upstream_results,
+            )
             return task_name, exec_res
 
         return asyncio.create_task(_runner())
