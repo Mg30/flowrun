@@ -89,6 +89,45 @@ What happened?
 
 These components are intentionally decoupled so you can replace one without rewriting the others—for example, swap the state store, inject a process pool, or build DAGs from configuration files.
 
+## Concurrency Model
+
+Flowrun launches as many ready tasks as possible while honoring dependency ordering and a global concurrency cap.
+
+- `Scheduler.run_dag_once` keeps an `inflight` map and submits eligible tasks via `asyncio.create_task`, so independent nodes execute concurrently as soon as their parents finish.
+- `SchedulerConfig.max_parallel` sets the cap; the default engine wires it to `4`. Increase it to allow more simultaneous tasks or dial it down when you want serialized execution.
+- Async specs run directly on the event loop, so raising `max_parallel` is enough to let more coroutines overlap.
+- Sync specs are offloaded through `TaskExecutor` into the injected `concurrent.futures.Executor`. Their throughput is constrained both by `max_parallel` and by the executor's worker count.
+
+### Tuning concurrency
+
+```python
+import concurrent.futures
+
+from flowrun.engine import Engine
+from flowrun.scheduler import Scheduler, SchedulerConfig
+from flowrun.executor import TaskExecutor
+from flowrun.state import StateStore
+from flowrun.task import TaskRegistry
+
+
+registry = TaskRegistry()
+registry.as_default()
+state = StateStore()
+pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)  # thread parallelism for sync tasks
+task_executor = TaskExecutor(pool)
+scheduler = Scheduler(
+    registry=registry,
+    state_store=state,
+    executor=task_executor,
+    config=SchedulerConfig(max_parallel=12),  # coroutine + worker cap
+)
+engine = Engine(registry=registry, state_store=state, scheduler=scheduler)
+```
+
+- Lower the `ThreadPoolExecutor` size (or swap in `ProcessPoolExecutor`) to throttle or isolate synchronous workloads.
+- When using only async tasks, you can keep the default thread pool small—`max_parallel` remains the primary knob.
+- You can still call `engine.scheduler.executor.executor.shutdown()` when you need to release threads or processes once the engine is no longer in use.
+
 ## Authoring Tasks
 
 ### Context Injection
