@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+from typing import Any
 
 import pytest
 
@@ -28,7 +29,7 @@ async def test_task_executor_runs_sync_function_with_context():
 
     thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        executor = TaskExecutor(thread_pool)
+        executor = TaskExecutor(executor=thread_pool)
         result = await executor.run_once(spec, spec.timeout_s, ctx)
     finally:
         thread_pool.shutdown(wait=True)
@@ -52,7 +53,7 @@ async def test_task_executor_reports_missing_context():
 
     thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        executor = TaskExecutor(thread_pool)
+        executor = TaskExecutor(executor=thread_pool)
         result = await executor.run_once(spec, spec.timeout_s, None)
     finally:
         thread_pool.shutdown(wait=True)
@@ -70,10 +71,37 @@ async def test_task_executor_times_out_async_task():
 
     thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        executor = TaskExecutor(thread_pool)
+        executor = TaskExecutor(executor=thread_pool)
         result = await executor.run_once(spec, spec.timeout_s, None)
     finally:
         thread_pool.shutdown(wait=True)
 
     assert result.ok is False
     assert result.error == "Timeout after 0.01s"
+
+
+@pytest.mark.asyncio
+async def test_task_executor_passes_upstream_results_to_sync_task():
+    captured: dict[str, Any] = {}
+
+    def child(upstream):
+        captured.update(upstream)
+        return upstream["root"] + 1
+
+    spec = TaskSpec(
+        name="child",
+        func=child,
+        timeout_s=1.0,
+        accepts_upstream=True,
+    )
+
+    thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        executor = TaskExecutor(executor=thread_pool)
+        result = await executor.run_once(spec, spec.timeout_s, None, {"root": 2})
+    finally:
+        thread_pool.shutdown(wait=True)
+
+    assert captured == {"root": 2}
+    assert result.ok is True
+    assert result.result == 3
