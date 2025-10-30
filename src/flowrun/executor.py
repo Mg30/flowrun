@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import functools
 import time
 import traceback
 from dataclasses import dataclass
@@ -41,24 +42,32 @@ class TaskExecutor:
 
     Uses:
     - asyncio for async tasks
-    - ThreadPoolExecutor for sync IO tasks
+    - a user-provided concurrent.futures.Executor for sync IO tasks
+    - optional upstream result propagation via ``upstream`` keyword argument
     """
 
-    def __init__(self, thread_pool: concurrent.futures.ThreadPoolExecutor) -> None:
+    def __init__(self, executor: concurrent.futures.Executor) -> None:
         """Initialize the TaskExecutor.
 
         Parameters
         ----------
-        thread_pool : concurrent.futures.ThreadPoolExecutor
-            ThreadPoolExecutor used to run synchronous task functions.
+        executor : concurrent.futures.Executor
+            Executor used to run synchronous task functions. The caller retains
+            ownership and is responsible for shutting it down when appropriate.
         """
-        self._thread_pool = thread_pool
+        self._executor = executor
+
+    @property
+    def executor(self) -> concurrent.futures.Executor:
+        """Expose the underlying executor for lifecycle management."""
+        return self._executor
 
     async def run_once(
         self,
         spec: TaskSpec,
         timeout_s: float | None,
         context: RunContext[Any] | None = None,
+        upstream_results: dict[str, Any] | None = None,
     ) -> ExecutionResult:
         """Execute a TaskSpec once, honoring an optional timeout and returning an ExecutionResult.
 
@@ -70,6 +79,11 @@ class TaskExecutor:
         timeout_s : float | None
             Maximum number of seconds to allow the task to run for this attempt,
             or None to disable the timeout.
+        context : RunContext[Any] | None
+            Optional runtime context passed to tasks that opt-in via signature.
+        upstream_results : dict[str, Any] | None
+            Mapping of completed dependency task names to their results. Provided
+            only when the task declares an ``upstream`` parameter.
 
         Returns
         -------
@@ -86,22 +100,25 @@ class TaskExecutor:
         start = time.time()
         try:
             if spec.requires_context and context is None:
-                raise RuntimeError(
-                    f"Task '{spec.name}' requires a RunContext but none was provided."
-                )
+                raise RuntimeError(f"Task '{spec.name}' requires a RunContext but none was provided.")
 
             args: tuple[Any, ...] = ()
             if context is not None and spec.accepts_context:
                 args = (context,)
 
+            kwargs: dict[str, Any] = {}
+            if spec.accepts_upstream:
+                kwargs["upstream"] = upstream_results or {}
+
             if spec.is_async():
                 # run coroutine directly with timeout
-                coro = spec.func(*args)
+                coro = spec.func(*args, **kwargs)
                 res = await asyncio.wait_for(coro, timeout=timeout_s)
             else:
                 # run sync func in thread pool with timeout
                 loop = asyncio.get_running_loop()
-                fut = loop.run_in_executor(self._thread_pool, spec.func, *args)
+                call = functools.partial(spec.func, *args, **kwargs)
+                fut = loop.run_in_executor(self._executor, call)
                 res = await asyncio.wait_for(fut, timeout=timeout_s)
 
             return ExecutionResult(
@@ -109,7 +126,7 @@ class TaskExecutor:
                 result=res,
                 duration_s=time.time() - start,
             )
-        except TimeoutError:
+        except (asyncio.exceptions.TimeoutError, TimeoutError):
             return ExecutionResult(
                 ok=False,
                 error=f"Timeout after {timeout_s}s",
