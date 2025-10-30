@@ -1,0 +1,46 @@
+[project]
+name = "flowrun"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "ruff>=0.14.2",
+]
+
+[tool.ruff]
+line-length = 120
+extend-include = ["*.ipynb"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "A",   # flake8-builtins
+    "PLC", # pylint conventions
+    "PLE", # pylint errors
+    "PLW", # pylint warnings
+    "UP",  # pyupgrade"
+    "S",   # flake8-bandit,
+    "B",   # flake8-bugbear
+    "I",   # isort
+    "D",   # pydocstyle
+    "NPY", # NumPy-specific rules
+]
+ignore = ["E501", "D2", "D3", "D4", "D104", "D100", "D106", "S311", "B008"]
+exclude = ["tests/*"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
