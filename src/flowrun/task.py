@@ -24,6 +24,9 @@ class TaskSpec:
         True when the task function signature allows a positional RunContext argument.
     requires_context : bool
         True when the task function signature requires a positional RunContext argument.
+    accepts_upstream : bool
+        True when the task function signature includes an ``upstream`` parameter to
+        receive dependency results as a mapping.
 
     Methods
     -------
@@ -38,6 +41,7 @@ class TaskSpec:
     timeout_s: float | None = 30.0
     accepts_context: bool = False
     requires_context: bool = False
+    accepts_upstream: bool = False
 
     def is_async(self) -> bool:
         """Return True if the registered task function is an async coroutine function.
@@ -105,6 +109,8 @@ def task(
     Execution mode is inferred automatically (async callables run directly,
     sync callables run in a thread pool).
     The registry must be passed explicitly -> promotes DI.
+    Tasks may declare an ``upstream`` parameter to receive dependency results as
+    a ``dict[str, Any]`` mapping while keeping signatures explicit.
     """
     if registry is None:
         registry = TaskRegistry.get_default()
@@ -163,7 +169,20 @@ def task(
                         return True, param.default is inspect._empty
             return False, False
 
+        def _accepts_upstream(callable_obj: Callable[..., Any]) -> bool:
+            sig = inspect.signature(callable_obj)
+            for param in sig.parameters.values():
+                if param.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                ):
+                    if param.name == "upstream":
+                        return True
+            return False
+
         accepts_context, requires_context = _context_signature_flags(func)
+        accepts_upstream = _accepts_upstream(func)
         spec = TaskSpec(
             name=name or func.__name__,
             func=func,
@@ -171,6 +190,7 @@ def task(
             timeout_s=timeout_s,
             accepts_context=accepts_context,
             requires_context=requires_context,
+            accepts_upstream=accepts_upstream,
         )
         registry.register(spec)
         func.__flowrun_task_name__ = spec.name  # type: ignore[attr-defined]
