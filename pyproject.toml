@@ -1,5 +1,5 @@
 [project]
-name = "flowrun"
+name = "flowrun-dag"
 version = "0.1.0"
 description = "A lightweight async DAG orchestrator for small to medium ETL pipelines"
 readme = "README.md"
