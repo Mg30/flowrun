@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import functools
+import logging
 import time
 import traceback
 from dataclasses import dataclass
@@ -8,6 +9,8 @@ from typing import Any
 
 from flowrun.context import RunContext
 from flowrun.task import TaskSpec
+
+_default_logger = logging.getLogger("flowrun.executor")
 
 
 @dataclass
@@ -46,7 +49,12 @@ class TaskExecutor:
     - optional upstream result propagation via ``upstream`` keyword argument
     """
 
-    def __init__(self, executor: concurrent.futures.Executor) -> None:
+    def __init__(
+        self,
+        executor: concurrent.futures.Executor,
+        *,
+        logger: logging.Logger | None = None,
+    ) -> None:
         """Initialize the TaskExecutor.
 
         Parameters
@@ -54,8 +62,11 @@ class TaskExecutor:
         executor : concurrent.futures.Executor
             Executor used to run synchronous task functions. The caller retains
             ownership and is responsible for shutting it down when appropriate.
+        logger : logging.Logger | None
+            Optional logger instance. Falls back to ``logging.getLogger('flowrun.executor')``.
         """
         self._executor = executor
+        self._log = logger or _default_logger
 
     @property
     def executor(self) -> concurrent.futures.Executor:
@@ -109,6 +120,14 @@ class TaskExecutor:
             kwargs: dict[str, Any] = {}
             if spec.accepts_upstream:
                 kwargs["upstream"] = upstream_results or {}
+            elif spec.named_deps:
+                resolved = upstream_results or {}
+                for dep_name in spec.named_deps:
+                    if dep_name not in resolved:
+                        raise RuntimeError(
+                            f"Task '{spec.name}' expects upstream result '{dep_name}', but it was not provided."
+                        )
+                    kwargs[dep_name] = resolved[dep_name]
 
             if spec.is_async():
                 # run coroutine directly with timeout
@@ -127,12 +146,14 @@ class TaskExecutor:
                 duration_s=time.time() - start,
             )
         except (asyncio.exceptions.TimeoutError, TimeoutError):
+            self._log.warning("Task %r timed out after %ss", spec.name, timeout_s)
             return ExecutionResult(
                 ok=False,
                 error=f"Timeout after {timeout_s}s",
                 duration_s=time.time() - start,
             )
         except Exception as exc:
+            self._log.debug("Task %r raised %s", spec.name, type(exc).__name__, exc_info=True)
             return ExecutionResult(
                 ok=False,
                 error="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
