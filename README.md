@@ -14,14 +14,21 @@ Core ideas:
 ## Installation
 
 ```bash
-pip install flowrun
+pip install flowrun-dag
 ```
+
+> The import name remains `flowrun`:
+> ```python
+> import flowrun
+> ```
 
 For development:
 
 ```bash
-pip install -e .[dev]
-pytest -q
+git clone https://github.com/Mg30/flowrun.git
+cd flowrun
+uv sync --group dev
+uv run pytest -q
 ```
 
 ## Quick Start
