@@ -9,6 +9,14 @@ from flowrun.state import StateStore
 from flowrun.task import TaskRegistry, TaskSpec
 
 
+def test_scheduler_config_rejects_non_positive_max_parallel():
+    with pytest.raises(ValueError, match="max_parallel must be >= 1"):
+        SchedulerConfig(max_parallel=0)
+
+    with pytest.raises(ValueError, match="max_parallel must be >= 1"):
+        SchedulerConfig(max_parallel=-1)
+
+
 class DummyExecutor:
     def __init__(self, outcomes: dict[str, ExecutionResult]) -> None:
         self._outcomes = outcomes

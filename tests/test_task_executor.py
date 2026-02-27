@@ -105,3 +105,26 @@ async def test_task_executor_passes_upstream_results_to_sync_task():
     assert captured == {"root": 2}
     assert result.ok is True
     assert result.result == 3
+
+
+@pytest.mark.asyncio
+async def test_task_executor_injects_named_dependency_results_when_declared():
+    def child(root: int) -> int:
+        return root + 1
+
+    spec = TaskSpec(
+        name="child",
+        func=child,
+        timeout_s=1.0,
+        named_deps=["root"],
+    )
+
+    thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        executor = TaskExecutor(executor=thread_pool)
+        result = await executor.run_once(spec, spec.timeout_s, None, {"root": 2})
+    finally:
+        thread_pool.shutdown(wait=True)
+
+    assert result.ok is True
+    assert result.result == 3
