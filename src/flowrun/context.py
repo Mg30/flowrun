@@ -1,8 +1,6 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, TypeVar
-
-DepsT = TypeVar("DepsT")
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
