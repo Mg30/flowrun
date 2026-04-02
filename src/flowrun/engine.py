@@ -1,7 +1,7 @@
 import concurrent.futures
 import logging
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Sequence
 from types import TracebackType
 from typing import Any, Self
 
@@ -10,12 +10,24 @@ from flowrun.dag import DAGBuilder
 from flowrun.executor import TaskExecutor
 from flowrun.hooks import RunHook
 from flowrun.scheduler import Scheduler, SchedulerConfig
-from flowrun.state import RunRecord, StateStore, StateStoreProtocol
+from flowrun.state import RunRecord, StateStore
 from flowrun.task import TaskRegistry
 from flowrun.task import task as task_decorator
-from flowrun.task import task_template as task_template_factory
 
 _default_logger = logging.getLogger("flowrun")
+
+
+async def _iterate_contexts(
+    contexts: AsyncIterable[RunContext[Any] | None] | Iterable[RunContext[Any] | None],
+) -> AsyncIterator[RunContext[Any] | None]:
+    """Yield contexts from either a sync or async source."""
+    if isinstance(contexts, AsyncIterable):
+        async for context in contexts:
+            yield context
+        return
+
+    for context in contexts:
+        yield context
 
 
 class DagScope:
@@ -35,9 +47,8 @@ class DagScope:
         self,
         name: str | None = None,
         deps: Sequence[str | Callable[..., Any]] | None = None,
-        timeout_s: float | None = 30.0,
+        timeout_s: float | None = None,
         retries: int = 0,
-        retain_result: bool = True,
     ):
         """Return ``@task`` decorator bound to this scope's DAG."""
         return self._engine.task(
@@ -45,28 +56,19 @@ class DagScope:
             deps=deps,
             timeout_s=timeout_s,
             retries=retries,
-            retain_result=retain_result,
-            dag=self._dag_name,
-        )
-
-    def task_template(
-        self,
-        func: Callable[..., Any],
-        *,
-        deps: Sequence[str | Callable[..., Any]] | None = None,
-        timeout_s: float | None = 30.0,
-    ):
-        """Create a task template bound to this scope's DAG."""
-        return self._engine.task_template(
-            func,
-            deps=deps,
-            timeout_s=timeout_s,
             dag=self._dag_name,
         )
 
     async def run_once(self, context: RunContext[Any] | None = None) -> str:
         """Run this DAG once."""
         return await self._engine.run_once(self._dag_name, context=context)
+
+    async def run_many(
+        self,
+        contexts: AsyncIterable[RunContext[Any] | None] | Iterable[RunContext[Any] | None],
+    ) -> list[str]:
+        """Run this DAG once per context, sequentially, returning run ids in order."""
+        return await self._engine.run_many(self._dag_name, contexts)
 
     async def run_subgraph(
         self,
@@ -107,7 +109,7 @@ class Engine:
     def __init__(
         self,
         registry: TaskRegistry,
-        state_store: StateStoreProtocol,
+        state_store: StateStore,
         scheduler: Scheduler,
         *,
         _owns_pool: concurrent.futures.Executor | None = None,
@@ -182,6 +184,23 @@ class Engine:
         self._log.info("Finished DAG %r  run_id=%s", dag_name, run_id)
         return run_id
 
+    async def run_many(
+        self,
+        dag_name: str,
+        contexts: AsyncIterable[RunContext[Any] | None] | Iterable[RunContext[Any] | None],
+    ) -> list[str]:
+        """Run a DAG once per context, sequentially, returning run ids in source order.
+
+        This is intended for sequential micro-batch loops where the batch source
+        lives outside the DAG and each batch should execute the full graph.
+        """
+        self.validate(dag_name)
+
+        run_ids: list[str] = []
+        async for context in _iterate_contexts(contexts):
+            run_ids.append(await self.run_once(dag_name, context=context))
+        return run_ids
+
     async def resume(
         self,
         run_id: str,
@@ -226,6 +245,7 @@ class Engine:
             dag_name=prev.dag_name,
             task_names=dag.nodes,
             reset_tasks=reset_tasks,
+            metadata=context.metadata if context is not None and context.metadata else prev.metadata,
         )
 
         self._log.info(
@@ -354,6 +374,7 @@ class Engine:
         return {
             "run_id": rec.run_id,
             "dag_name": rec.dag_name,
+            "metadata": dict(rec.metadata),
             "created_at": rec.created_at,
             "finished_at": rec.finished_at,
             "status": run_status,
@@ -398,9 +419,8 @@ class Engine:
         self,
         name: str | None = None,
         deps: Sequence[str | Callable[..., Any]] | None = None,
-        timeout_s: float | None = 30.0,
+        timeout_s: float | None = None,
         retries: int = 0,
-        retain_result: bool = True,
         dag: str | None = None,
     ):
         """Return a ``@task`` decorator bound to this engine's registry."""
@@ -409,24 +429,6 @@ class Engine:
             deps=deps,
             timeout_s=timeout_s,
             retries=retries,
-            retain_result=retain_result,
-            dag=dag,
-            registry=self._registry,
-        )
-
-    def task_template(
-        self,
-        func: Callable[..., Any],
-        *,
-        deps: Sequence[str | Callable[..., Any]] | None = None,
-        timeout_s: float | None = 30.0,
-        dag: str | None = None,
-    ):
-        """Create a task template bound to this engine's registry."""
-        return task_template_factory(
-            func,
-            deps=deps,
-            timeout_s=timeout_s,
             dag=dag,
             registry=self._registry,
         )
@@ -439,7 +441,7 @@ def build_default_engine(
     max_parallel: int = 4,
     logger: logging.Logger | None = None,
     hooks: list[RunHook] | None = None,
-    state_store: StateStoreProtocol | None = None,
+    state_store: StateStore | None = None,
 ) -> Engine:
     """Convenience constructor that wires up all components into a ready-to-use Engine.
 
@@ -460,13 +462,13 @@ def build_default_engine(
         ``logging.getLogger('flowrun')``.
     hooks : list[RunHook] | None
         Optional lifecycle hooks forwarded to the scheduler.
-    state_store : StateStoreProtocol | None
-        Optional persistent state store (e.g. ``SqliteStateStore``).  When
-        omitted an in-memory ``StateStore`` is used.
+    state_store : StateStore | None
+        Optional custom state store. When omitted an in-memory ``StateStore``
+        is used.
     """
     log = logger or _default_logger
     registry = TaskRegistry()
-    actual_store: StateStoreProtocol = state_store if state_store is not None else StateStore()
+    actual_store = state_store if state_store is not None else StateStore()
     owns_pool: concurrent.futures.Executor | None = None
     if executor is None:
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)

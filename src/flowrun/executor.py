@@ -113,9 +113,16 @@ class TaskExecutor:
             if spec.requires_context and context is None:
                 raise RuntimeError(f"Task '{spec.name}' requires a RunContext but none was provided.")
 
+            if timeout_s is not None and not spec.is_async():
+                raise RuntimeError(
+                    f"Task '{spec.name}' is synchronous and cannot use timeout_s. "
+                    "Thread-based timeouts cannot safely stop blocking work. "
+                    "Use an async task or configure timeouts in the client you call inside the task."
+                )
+
             args: tuple[Any, ...] = ()
             if context is not None and spec.accepts_context:
-                args = (context,)
+                args = (context.with_deadline_s(timeout_s),)
 
             kwargs: dict[str, Any] = {}
             if spec.accepts_upstream:

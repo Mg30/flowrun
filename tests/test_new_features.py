@@ -1,9 +1,11 @@
-"""Tests for the new features: retries, retain_result, engine context manager."""
+"""Tests for the new features: retries and engine context manager."""
 
+import asyncio
 from typing import cast
 
 import pytest
 
+from flowrun.context import RunContext
 from flowrun.dag import DAG
 from flowrun.engine import Engine, build_default_engine
 from flowrun.executor import ExecutionResult, TaskExecutor
@@ -107,74 +109,6 @@ async def test_scheduler_retries_do_not_skip_children_prematurely():
 
     assert rec.tasks["parent"].status == "SUCCESS"
     assert rec.tasks["child"].status == "SUCCESS"
-
-
-# ---------------------------------------------------------------------------
-# retain_result tests
-# ---------------------------------------------------------------------------
-
-
-class TrackingExecutor:
-    """Executor that returns canned results and records calls."""
-
-    def __init__(self, results: dict[str, object]) -> None:
-        self._results = results
-        self.calls: list[str] = []
-
-    async def run_once(self, spec, timeout_s, context, upstream_results):
-        self.calls.append(spec.name)
-        return ExecutionResult(ok=True, result=self._results.get(spec.name), duration_s=0.01)
-
-
-@pytest.mark.asyncio
-async def test_retain_result_false_clears_after_consumers_launch():
-    """A task with retain_result=False should have its result cleared after dependents are done."""
-    registry = TaskRegistry()
-    registry.register(TaskSpec(name="big_df", func=lambda: None, retain_result=False))
-    registry.register(TaskSpec(name="consumer", func=lambda: None, deps=["big_df"]))
-
-    state_store = StateStore()
-    executor = TrackingExecutor({"big_df": "large-payload", "consumer": "done"})
-    scheduler = Scheduler(
-        registry,
-        state_store,
-        cast(TaskExecutor, executor),
-        SchedulerConfig(max_parallel=2),
-    )
-    dag = DAG(
-        name="mem_dag",
-        nodes=["big_df", "consumer"],
-        edges={"big_df": [], "consumer": ["big_df"]},
-    )
-
-    run_id = await scheduler.run_dag_once(dag)
-    rec = state_store.get_run(run_id)
-
-    assert rec.tasks["big_df"].status == "SUCCESS"
-    assert rec.tasks["big_df"].result is None  # cleared
-    assert rec.tasks["consumer"].result == "done"
-
-
-@pytest.mark.asyncio
-async def test_retain_result_true_keeps_result():
-    """The default retain_result=True should keep the result in state."""
-    registry = TaskRegistry()
-    registry.register(TaskSpec(name="keep_me", func=lambda: None, retain_result=True))
-
-    state_store = StateStore()
-    executor = TrackingExecutor({"keep_me": "important"})
-    scheduler = Scheduler(
-        registry,
-        state_store,
-        cast(TaskExecutor, executor),
-        SchedulerConfig(max_parallel=2),
-    )
-    dag = DAG(name="keep_dag", nodes=["keep_me"], edges={"keep_me": []})
-
-    run_id = await scheduler.run_dag_once(dag)
-    rec = state_store.get_run(run_id)
-
-    assert rec.tasks["keep_me"].result == "important"
 
 
 # ---------------------------------------------------------------------------
@@ -320,18 +254,21 @@ async def test_engine_dag_scope_registers_and_runs_without_repeating_dag():
 
 
 @pytest.mark.asyncio
-async def test_engine_dag_scope_supports_templates_and_subgraph():
+async def test_engine_dag_scope_supports_factory_registered_tasks_and_subgraph():
     engine = build_default_engine(max_workers=2, max_parallel=2)
     etl = engine.dag("templated")
 
-    def fetch(*, table: str) -> str:
-        return table
+    def bind_fetch(*, name: str, table: str):
+        @etl.task(name=name)
+        def fetch() -> str:
+            return table
 
-    tpl = etl.task_template(fetch)
-    tpl.bind("fetch_users", table="users")
-    tpl.bind("fetch_orders", table="orders")
+        return fetch
 
-    @etl.task(name="combine", deps=["fetch_users", "fetch_orders"])
+    fetch_users = bind_fetch(name="fetch_users", table="users")
+    fetch_orders = bind_fetch(name="fetch_orders", table="orders")
+
+    @etl.task(name="combine", deps=[fetch_users, fetch_orders])
     def combine(fetch_users: str, fetch_orders: str) -> str:
         return f"{fetch_users}+{fetch_orders}"
 
@@ -343,6 +280,119 @@ async def test_engine_dag_scope_supports_templates_and_subgraph():
 
     assert report["status"] == "SUCCESS"
     assert set(report["tasks"].keys()) == {"fetch_users", "fetch_orders", "combine"}
+
+
+@pytest.mark.asyncio
+async def test_run_context_metadata_is_reported():
+    engine = build_default_engine(max_workers=2, max_parallel=2)
+
+    @engine.task(dag="metadata_demo")
+    def extract(context: RunContext[dict[str, int]]) -> int:
+        return context.value
+
+    context = RunContext({"value": 3}).with_metadata(batch_id=7, source="api_users")
+
+    async with engine:
+        run_id = await engine.run_once("metadata_demo", context=context)
+        report = engine.get_run_report(run_id)
+
+    assert report["metadata"] == {"batch_id": 7, "source": "api_users"}
+
+
+@pytest.mark.asyncio
+async def test_run_many_reports_context_metadata_per_run():
+    engine = build_default_engine(max_workers=2, max_parallel=2)
+    seen: list[tuple[str, int]] = []
+
+    @engine.task(name="input_chunk", dag="micro_batch")
+    def input_chunk(context: RunContext[dict[str, int]]) -> dict[str, int]:
+        seen.append(("input", context.batch_id))
+        return {"batch_id": context.batch_id, "value": context.value}
+
+    @engine.task(name="double", dag="micro_batch", deps=[input_chunk])
+    def double(input_chunk: dict[str, int]) -> int:
+        seen.append(("double", input_chunk["batch_id"]))
+        return input_chunk["value"] * 2
+
+    contexts = [
+        RunContext({"batch_id": 1, "value": 3}).with_metadata(batch_id=1, source="users"),
+        RunContext({"batch_id": 2, "value": 5}).with_metadata(batch_id=2, source="users"),
+    ]
+
+    async with engine:
+        run_ids = await engine.run_many("micro_batch", contexts)
+        reports = [engine.get_run_report(run_id) for run_id in run_ids]
+
+    assert len(run_ids) == 2
+    assert [report["metadata"]["batch_id"] for report in reports] == [1, 2]
+    assert [report["tasks"]["double"]["result"] for report in reports] == [6, 10]
+    assert seen == [("input", 1), ("double", 1), ("input", 2), ("double", 2)]
+
+
+@pytest.mark.asyncio
+async def test_engine_run_many_supports_iterable_contexts_sequentially():
+    engine = build_default_engine(max_workers=2, max_parallel=2)
+    seen: list[tuple[str, int]] = []
+
+    @engine.task(name="input_chunk", dag="micro_batch")
+    def input_chunk(context: RunContext[dict[str, int]]) -> dict[str, int]:
+        seen.append(("input", context.batch_id))
+        return {"batch_id": context.batch_id, "value": context.value}
+
+    @engine.task(name="double", dag="micro_batch", deps=[input_chunk])
+    def double(input_chunk: dict[str, int]) -> int:
+        seen.append(("double", input_chunk["batch_id"]))
+        return input_chunk["value"] * 2
+
+    contexts = [
+        RunContext({"batch_id": 1, "value": 3}),
+        RunContext({"batch_id": 2, "value": 5}),
+    ]
+
+    async with engine:
+        run_ids = await engine.run_many("micro_batch", contexts)
+        reports = [engine.get_run_report(run_id) for run_id in run_ids]
+
+    assert len(run_ids) == 2
+    assert [report["tasks"]["double"]["result"] for report in reports] == [6, 10]
+    assert seen == [("input", 1), ("double", 1), ("input", 2), ("double", 2)]
+
+
+@pytest.mark.asyncio
+async def test_engine_dag_scope_run_many_supports_async_iterables():
+    engine = build_default_engine(max_workers=2, max_parallel=2)
+    etl = engine.dag("micro_batch_scope")
+    seen: list[tuple[str, int]] = []
+
+    @etl.task(name="input_chunk")
+    def input_chunk(context: RunContext[dict[str, int]]) -> dict[str, int]:
+        seen.append(("input", context.batch_id))
+        return {"batch_id": context.batch_id, "value": context.value}
+
+    @etl.task(name="double", deps=[input_chunk])
+    def double(input_chunk: dict[str, int]) -> int:
+        seen.append(("double", input_chunk["batch_id"]))
+        return input_chunk["value"] * 2
+
+    async def contexts():
+        for batch_id, value in [(1, 3), (2, 5), (3, 7)]:
+            await asyncio.sleep(0)
+            yield RunContext({"batch_id": batch_id, "value": value})
+
+    async with engine:
+        run_ids = await etl.run_many(contexts())
+        reports = [engine.get_run_report(run_id) for run_id in run_ids]
+
+    assert len(run_ids) == 3
+    assert [report["tasks"]["double"]["result"] for report in reports] == [6, 10, 14]
+    assert seen == [
+        ("input", 1),
+        ("double", 1),
+        ("input", 2),
+        ("double", 2),
+        ("input", 3),
+        ("double", 3),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -360,15 +410,3 @@ def test_state_mark_retry_resets_to_pending(state_store):
     rec = state_store.get_run("r1")
     assert rec.tasks["t1"].status == "PENDING"
     assert rec.tasks["t1"].error is None
-
-
-def test_state_clear_result(state_store):
-    """clear_result should set the result field to None."""
-    state_store.create_run("r1", "dag", ["t1"])
-    state_store.mark_running("r1", "t1")
-    state_store.mark_success("r1", "t1", result="big-data")
-    state_store.clear_result("r1", "t1")
-
-    rec = state_store.get_run("r1")
-    assert rec.tasks["t1"].status == "SUCCESS"
-    assert rec.tasks["t1"].result is None

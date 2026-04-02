@@ -1,5 +1,3 @@
-import contextvars
-import functools
 import inspect
 import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -7,11 +5,6 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any, get_args, get_origin
 
 from flowrun.context import RunContext
-
-_active_registry: contextvars.ContextVar["TaskRegistry | None"] = contextvars.ContextVar(
-    "flowrun_active_registry",
-    default=None,
-)
 
 
 @dataclass(frozen=True)
@@ -27,7 +20,7 @@ class TaskSpec:
     deps : list[str]
         List of task names this task depends on.
     timeout_s : float | None
-        Timeout in seconds for task execution, or None for no timeout.
+        Timeout in seconds for async task execution, or None for no timeout.
     accepts_context : bool
         True when the task function signature allows a positional RunContext argument.
     requires_context : bool
@@ -51,9 +44,8 @@ class TaskSpec:
     name: str
     func: Callable[..., Any]
     deps: list[str] = field(default_factory=list)
-    timeout_s: float | None = 30.0
+    timeout_s: float | None = None
     retries: int = 0
-    retain_result: bool = True
     dag: str | None = None
     accepts_context: bool = False
     requires_context: bool = False
@@ -73,44 +65,12 @@ class TaskRegistry:
     """Registry that maps task names to `TaskSpec` objects.
 
     Supports the standard collection protocol (`in`, `len`, iteration,
-    subscript) and a `contextvars`-based activation model that is safe
-    across async tasks and threads.
+    subscript).
     """
 
     def __init__(self) -> None:
         """Initialize an empty task registry."""
         self._tasks: dict[str, TaskSpec] = {}
-
-    # ---- active-registry management (contextvars, async-safe) ----
-
-    @staticmethod
-    def active() -> "TaskRegistry":
-        """Return the currently active registry.
-
-        Raises
-        ------
-        LookupError
-            If no registry has been activated.
-        """
-        reg = _active_registry.get()
-        if reg is None:
-            raise LookupError(
-                "No active TaskRegistry; pass registry=... to @task or activate one with `registry.activate()`."
-            )
-        return reg
-
-    def activate(self) -> contextvars.Token["TaskRegistry | None"]:
-        """Make this registry the active one and return a reset token.
-
-        The token can be passed to `deactivate()` to restore the previous
-        registry, or used directly with `contextvars.ContextVar.reset`.
-        """
-        return _active_registry.set(self)
-
-    @staticmethod
-    def deactivate(token: contextvars.Token["TaskRegistry | None"]) -> None:
-        """Restore the previous active registry from a token."""
-        _active_registry.reset(token)
 
     # ---- collection protocol ----
 
@@ -122,6 +82,7 @@ class TaskRegistry:
         ValueError
             If a task with the same name is already registered.
         """
+        _validate_task_spec(spec)
         if spec.name in self._tasks:
             raise ValueError(f"Duplicate task name: {spec.name!r}")
         self._tasks[spec.name] = spec
@@ -242,6 +203,26 @@ def _accepts_upstream(callable_obj: Callable[..., Any]) -> bool:
     )
 
 
+def _infer_required_dep_names(callable_obj: Callable[..., Any], registry: TaskRegistry) -> list[str]:
+    """Infer dependency names from required parameters that match registered tasks."""
+    sig = inspect.signature(callable_obj)
+    inferred: list[str] = []
+    for param in sig.parameters.values():
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        if param.name in {"self", "cls"}:
+            continue
+        if param.default is not inspect._empty:
+            continue
+        if _annotation_is_run_context(param.annotation):
+            continue
+        if param.name == "upstream":
+            continue
+        if param.name in registry:
+            inferred.append(param.name)
+    return inferred
+
+
 def _accepted_named_deps(callable_obj: Callable[..., Any], dep_names: list[str]) -> list[str]:
     """Return the subset of *dep_names* that appear as parameter names in *callable_obj*."""
     sig = inspect.signature(callable_obj)
@@ -258,14 +239,56 @@ def _accepted_named_deps(callable_obj: Callable[..., Any], dep_names: list[str])
     ]
 
 
+def _unsatisfied_required_params(callable_obj: Callable[..., Any], dep_names: Sequence[str]) -> list[str]:
+    """Return required parameters that flowrun cannot satisfy for *callable_obj*."""
+    sig = inspect.signature(callable_obj)
+    unsatisfied: list[str] = []
+    for param in sig.parameters.values():
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        if param.name in {"self", "cls"}:
+            continue
+        if param.default is not inspect._empty:
+            continue
+        if _annotation_is_run_context(param.annotation):
+            continue
+        if param.name == "upstream":
+            continue
+        if param.name in dep_names:
+            continue
+        unsatisfied.append(param.name)
+    return unsatisfied
+
+
+def _validate_task_spec(spec: TaskSpec) -> None:
+    """Reject task configurations that would fail late or behave unsafely."""
+    if spec.timeout_s is not None and not spec.is_async():
+        raise ValueError(
+            f"Task {spec.name!r} is synchronous and cannot use timeout_s. "
+            "Thread-based timeouts cannot safely stop blocking work. "
+            "Use an async task or configure timeouts in the client you call inside the task."
+        )
+
+    unsatisfied = _unsatisfied_required_params(spec.func, spec.deps)
+    if unsatisfied:
+        deps_display = ", ".join(spec.deps) if spec.deps else "(none)"
+        raise ValueError(
+            f"Task {spec.name!r} has required parameters that flowrun cannot provide: {', '.join(unsatisfied)}. "
+            f"Available dependency names: {deps_display}. "
+            "Required parameters must either be annotated as RunContext, named 'upstream', "
+            "or exactly match a dependency name. When deps is omitted, flowrun only infers already-registered "
+            "task names from required parameters. If you use dependency names that are not valid Python "
+            "identifiers, consume them through the upstream mapping or rename the task."
+        )
+
+
 def task(
     _func: Callable[..., Any] | str | None = None,
     *,
     name: str | None = None,
     deps: Sequence[str | Callable[..., Any]] | None = None,
-    timeout_s: float | None = 30.0,
+    timeout_s: float | None = None,
     retries: int = 0,
-    retain_result: bool = True,
     dag: str | None = None,
     registry: TaskRegistry | None = None,
 ):
@@ -276,26 +299,23 @@ def task(
     name : str | None
         Optional explicit name; defaults to ``func.__name__``.
     deps : Sequence[str | Callable] | None
-        Task dependencies (names or previously-decorated callables).
+        Task dependencies (names or previously-decorated callables). When omitted,
+        required parameter names that match already-registered task names are inferred.
     timeout_s : float | None
-        Timeout in seconds, or ``None`` for no timeout.
+        Per-attempt timeout for async tasks, or ``None`` for no timeout.
     retries : int
         Number of times to retry on failure (0 = no retries).
-    retain_result : bool
-        When False, the result is cleared from state once all downstream
-        consumers have been launched, freeing memory for large payloads.
     dag : str | None
         Optional DAG namespace used by ``Engine.run_once(dag_name=...)`` to
         select only tasks belonging to that DAG.
     registry : TaskRegistry | None
-        Registry to register with.  When omitted, falls back to
-        ``TaskRegistry.active()``.
+        Registry to register with. Required when using ``task(...)`` directly.
     """
     if registry is None:
-        registry = TaskRegistry.active()
+        raise TypeError("task(...): registry= is required. Prefer engine.task(...) or etl.task(...).")
 
     def wrapper(func: Callable[..., Any]):
-        dep_names = _normalize_deps(deps)
+        dep_names = _normalize_deps(deps) if deps is not None else _infer_required_dep_names(func, registry)
         ctx_accepts, ctx_requires = _context_signature_flags(func)
         has_upstream = _accepts_upstream(func)
         named = [] if has_upstream else _accepted_named_deps(func, dep_names)
@@ -306,7 +326,6 @@ def task(
             deps=dep_names,
             timeout_s=timeout_s,
             retries=retries,
-            retain_result=retain_result,
             dag=dag,
             accepts_context=ctx_accepts,
             requires_context=ctx_requires,
@@ -326,58 +345,3 @@ def task(
     if _func is None:
         return wrapper
     return wrapper(_func)
-
-
-@dataclass(frozen=True)
-class TaskTemplate:
-    """Reusable template for registering many parameterized tasks.
-
-    This is intended for cases where you want to register the *same* task
-    implementation multiple times under different names with some arguments
-    pre-bound (e.g. one task per API endpoint).
-    """
-
-    func: Callable[..., Any]
-    deps: Sequence[str | Callable[..., Any]] | None = None
-    timeout_s: float | None = 30.0
-    dag: str | None = None
-    registry: TaskRegistry | None = None
-
-    def bind(self, name: str, /, *args: Any, **kwargs: Any) -> Callable[..., Any]:
-        """Register a new task by binding arguments into the template callable.
-
-        Parameters
-        ----------
-        name : str
-            Name for the registered task.
-        *args, **kwargs
-            Arguments to pre-bind into the underlying task callable.
-            These are applied via ``functools.partial``.
-
-        Returns
-        -------
-        Callable[..., Any]
-            The bound callable that was registered.
-        """
-        bound = functools.partial(self.func, *args, **kwargs)
-        # Reuse the existing @task decorator machinery so dependency normalization
-        # and signature-based flags (context/upstream) stay consistent.
-        return task(
-            name=name,
-            deps=self.deps,
-            timeout_s=self.timeout_s,
-            dag=self.dag,
-            registry=self.registry,
-        )(bound)
-
-
-def task_template(
-    func: Callable[..., Any],
-    *,
-    deps: Sequence[str | Callable[..., Any]] | None = None,
-    timeout_s: float | None = 30.0,
-    dag: str | None = None,
-    registry: TaskRegistry | None = None,
-) -> TaskTemplate:
-    """Create a TaskTemplate for registering parameterized instances of a task."""
-    return TaskTemplate(func=func, deps=deps, timeout_s=timeout_s, dag=dag, registry=registry)

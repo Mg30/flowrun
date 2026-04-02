@@ -64,11 +64,11 @@ class ProcessDataResult(TypedDict):
     version: int
 
 
+# Task names default to the function name. Use name="fetch_api_v2" only if the
+# orchestration name should stay stable while the Python function is renamed.
 @engine.task(
-    name="fetch_api",
     dag="demo_dag",
     deps=[],
-    timeout_s=5.0,
     retries=1,
 )
 def fetch_api(ctx: RunContext[DemoDeps]):
@@ -82,7 +82,6 @@ def fetch_api(ctx: RunContext[DemoDeps]):
 
 
 @engine.task(
-    name="fetch_metadata",
     dag="demo_dag",
     deps=[],
     timeout_s=5.0,
@@ -95,11 +94,8 @@ async def fetch_metadata():
 
 
 @engine.task(
-    name="process_data",
     dag="demo_dag",
     deps=[fetch_api, fetch_metadata],
-    timeout_s=10.0,
-    retain_result=False,  # free intermediate memory after consumers finish
 )
 def process_data(fetch_api: FetchApiResult, fetch_metadata: FetchMetadataResult) -> ProcessDataResult:
     """Pretend to transform upstream results into a final data artifact."""
@@ -115,10 +111,8 @@ def process_data(fetch_api: FetchApiResult, fetch_metadata: FetchMetadataResult)
 
 
 @engine.task(
-    name="store_results",
     dag="demo_dag",
     deps=[process_data],
-    timeout_s=10.0,
 )
 def store_results(process_data: ProcessDataResult) -> str:
     """Fake persistence step that stores the processed result."""

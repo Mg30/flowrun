@@ -189,8 +189,6 @@ async def test_engine_resume_skips_successful_tasks():
     from flowrun.engine import Engine
 
     registry = _build_diamond_registry()
-    tok = registry.activate()
-
     state = StateStore()
 
     # Build a first run where A+B succeeded but C failed
@@ -221,8 +219,6 @@ async def test_engine_resume_skips_successful_tasks():
     rec = state.get_run(new_run_id)
     assert all(rec.tasks[t].status == "SUCCESS" for t in ["A", "B", "C", "D"])
 
-    TaskRegistry.deactivate(tok)
-
 
 @pytest.mark.asyncio
 async def test_engine_resume_from_tasks():
@@ -230,7 +226,6 @@ async def test_engine_resume_from_tasks():
     from flowrun.engine import Engine
 
     registry = _build_diamond_registry()
-    tok = registry.activate()
     state = StateStore()
 
     # All tasks succeeded in the original run
@@ -259,8 +254,6 @@ async def test_engine_resume_from_tasks():
     assert rec.tasks["B"].result == "b-v2"  # re-executed
     assert rec.tasks["D"].result == "d-v2"  # re-executed
 
-    TaskRegistry.deactivate(tok)
-
 
 # ---------------------------------------------------------------------------
 # Engine.run_subgraph (integration)
@@ -273,7 +266,6 @@ async def test_engine_run_subgraph():
     from flowrun.engine import Engine
 
     registry = _build_diamond_registry()
-    tok = registry.activate()
     state = StateStore()
 
     executor = DummyExecutor(
@@ -295,5 +287,3 @@ async def test_engine_run_subgraph():
     assert "D" not in rec.tasks
     assert rec.tasks["A"].status == "SUCCESS"
     assert rec.tasks["B"].status == "SUCCESS"
-
-    TaskRegistry.deactivate(tok)

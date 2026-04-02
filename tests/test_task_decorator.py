@@ -1,19 +1,17 @@
+import pytest
+
 from flowrun.context import RunContext
-from flowrun.task import TaskRegistry, task, task_template
+from flowrun.task import TaskRegistry, task
 
 
-def test_task_decorator_supports_bare_usage():
+def test_task_decorator_requires_explicit_registry():
     registry = TaskRegistry()
-    token = registry.activate()
-    try:
+
+    with pytest.raises(TypeError, match="registry= is required"):
+
         @task
         def bare() -> int:
             return 1
-    finally:
-        TaskRegistry.deactivate(token)
-
-    spec = registry.get("bare")
-    assert spec.func is bare
 
 
 def test_task_decorator_supports_positional_name():
@@ -57,38 +55,48 @@ def test_task_decorator_normalizes_callable_dependencies():
     assert registry.get("producer").deps == []
 
 
-def test_task_template_registers_parameterized_tasks_and_preserves_upstream_acceptance():
+def test_task_decorator_infers_dependencies_from_required_parameter_names():
     registry = TaskRegistry()
 
-    def fetch(*, value: str, upstream=None) -> str:
-        return value
+    @task(name="producer", registry=registry)
+    def producer() -> int:
+        return 1
 
-    tpl = task_template(fetch, registry=registry)
-    tpl.bind("fetch_alpha", value="alpha")
-    tpl.bind("fetch_beta", value="beta")
+    @task(registry=registry)
+    def consumer(producer: int) -> int:
+        return producer + 1
 
-    spec_a = registry.get("fetch_alpha")
-    spec_b = registry.get("fetch_beta")
+    spec = registry.get("consumer")
 
-    assert spec_a.func() == "alpha"
-    assert spec_b.func() == "beta"
-    assert spec_a.accepts_upstream is True
-    assert spec_b.accepts_upstream is True
+    assert spec.deps == ["producer"]
+    assert spec.named_deps == ["producer"]
 
 
-def test_task_template_bound_callables_can_be_used_directly_as_dependencies():
+def test_task_decorator_inference_requires_registered_dependency_names():
     registry = TaskRegistry()
 
-    def fetch(*, value: str) -> str:
-        return value
+    with pytest.raises(ValueError, match="already-registered task names"):
 
-    tpl = task_template(fetch, registry=registry)
-    fetch_alpha = tpl.bind("fetch_alpha", value="alpha")
-    fetch_beta = tpl.bind("fetch_beta", value="beta")
+        @task(name="consumer", registry=registry)
+        def consumer(producer: int) -> int:
+            return producer
 
-    @task(name="combine", deps=[fetch_alpha, fetch_beta], registry=registry)
-    def combine(fetch_alpha: str, fetch_beta: str) -> str:
-        return f"{fetch_alpha}+{fetch_beta}"
 
-    spec = registry.get("combine")
-    assert spec.deps == ["fetch_alpha", "fetch_beta"]
+def test_task_decorator_rejects_unsatisfied_required_parameters():
+    registry = TaskRegistry()
+
+    with pytest.raises(ValueError, match="cannot provide"):
+
+        @task(name="consumer", deps=["fetch-users"], registry=registry)
+        def consumer(fetch_users: int) -> int:
+            return fetch_users
+
+
+def test_task_decorator_rejects_sync_timeouts():
+    registry = TaskRegistry()
+
+    with pytest.raises(ValueError, match="cannot use timeout_s"):
+
+        @task(name="sync_task", timeout_s=1.0, registry=registry)
+        def sync_task() -> int:
+            return 1
