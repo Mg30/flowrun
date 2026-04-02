@@ -22,7 +22,7 @@ async def test_task_executor_runs_sync_function_with_context():
     spec = TaskSpec(
         name="sync",
         func=sync_task,
-        timeout_s=1.0,
+        timeout_s=None,
         accepts_context=True,
         requires_context=True,
     )
@@ -46,7 +46,7 @@ async def test_task_executor_reports_missing_context():
     spec = TaskSpec(
         name="needs_ctx",
         func=sync_task,
-        timeout_s=1.0,
+        timeout_s=None,
         accepts_context=True,
         requires_context=True,
     )
@@ -91,7 +91,7 @@ async def test_task_executor_passes_upstream_results_to_sync_task():
     spec = TaskSpec(
         name="child",
         func=child,
-        timeout_s=1.0,
+        timeout_s=None,
         accepts_upstream=True,
     )
 
@@ -115,7 +115,7 @@ async def test_task_executor_injects_named_dependency_results_when_declared():
     spec = TaskSpec(
         name="child",
         func=child,
-        timeout_s=1.0,
+        timeout_s=None,
         named_deps=["root"],
     )
 
@@ -128,3 +128,58 @@ async def test_task_executor_injects_named_dependency_results_when_declared():
 
     assert result.ok is True
     assert result.result == 3
+
+
+@pytest.mark.asyncio
+async def test_task_executor_derives_deadline_on_context():
+    captured: dict[str, float | None] = {}
+
+    class Deps:
+        pass
+
+    ctx = RunContext(Deps())
+
+    async def async_task(context: RunContext[Deps]) -> float:
+        captured["remaining"] = context.time_remaining_s()
+        return captured["remaining"] or -1.0
+
+    spec = TaskSpec(
+        name="timed_async",
+        func=async_task,
+        timeout_s=0.05,
+        accepts_context=True,
+        requires_context=True,
+    )
+
+    thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        executor = TaskExecutor(executor=thread_pool)
+        result = await executor.run_once(spec, spec.timeout_s, ctx)
+    finally:
+        thread_pool.shutdown(wait=True)
+
+    assert result.ok is True
+    assert captured["remaining"] is not None
+    assert 0.0 < captured["remaining"] <= 0.05
+
+
+@pytest.mark.asyncio
+async def test_task_executor_rejects_sync_timeouts_without_running_task():
+    side_effects: list[str] = []
+
+    def slow_sync_task() -> str:
+        side_effects.append("ran")
+        return "done"
+
+    spec = TaskSpec(name="slow_sync", func=slow_sync_task, timeout_s=0.01)
+
+    thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        executor = TaskExecutor(executor=thread_pool)
+        result = await executor.run_once(spec, spec.timeout_s, None)
+    finally:
+        thread_pool.shutdown(wait=True)
+
+    assert result.ok is False
+    assert "cannot use timeout_s" in (result.error or "")
+    assert side_effects == []

@@ -1,6 +1,6 @@
 [project]
 name = "flowrun-dag"
-version = "0.1.0"
+version = "1.0.0"
 description = "A lightweight async DAG orchestrator for small to medium ETL pipelines"
 readme = "README.md"
 license = { text = "MIT" }
@@ -22,6 +22,10 @@ classifiers = [
 Homepage = "https://github.com/Mg30/flowrun"
 Repository = "https://github.com/Mg30/flowrun"
 Issues = "https://github.com/Mg30/flowrun/issues"
+
+[project.optional-dependencies]
+examples = ["polars>=1.39.3", "pandera[polars]>=0.30.1"]
+
 [dependency-groups]
 dev = ["pytest>=8.4.2", "pytest-asyncio>=1.2.0", "ruff>=0.14.2"]
 

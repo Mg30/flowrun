@@ -18,7 +18,7 @@ from flowrun.hooks import (
     TaskStartEvent,
     TaskSuccessEvent,
 )
-from flowrun.state import StateStoreProtocol
+from flowrun.state import StateStore
 from flowrun.task import TaskRegistry
 
 _default_logger = logging.getLogger("flowrun.scheduler")
@@ -53,7 +53,7 @@ class Scheduler:
     def __init__(
         self,
         registry: TaskRegistry,
-        state_store: StateStoreProtocol,
+        state_store: StateStore,
         executor: TaskExecutor,
         config: SchedulerConfig,
         *,
@@ -90,7 +90,8 @@ class Scheduler:
         """
         if run_id is None:
             run_id = str(uuid.uuid4())
-            self._state.create_run(run_id, dag.name, dag.nodes)
+            metadata = context.metadata if context is not None else None
+            self._state.create_run(run_id, dag.name, dag.nodes, metadata=metadata)
         self._hooks.emit("on_dag_start", DagStartEvent(run_id=run_id, dag_name=dag.name))
 
         inflight: dict[str, asyncio.Task] = {}
@@ -191,9 +192,6 @@ class Scheduler:
             # 5. mark SKIPPED tasks whose parents permanently FAILED
             self._mark_skipped_blocked(run_id, dag)
 
-            # 6. release memory for non-retained results whose consumers are all launched/done
-            self._release_non_retained(run_id, dag)
-
             self._state.finalize_run_if_done(run_id)
 
             # loop again until nothing left
@@ -266,22 +264,3 @@ class Scheduler:
                             reason="UPSTREAM_FAILED",
                         ),
                     )
-
-    def _release_non_retained(self, run_id: str, dag: DAG) -> None:
-        """Clear results for tasks with ``retain_result=False`` once all dependents are done/launched."""
-        runrec = self._state.get_run(run_id)
-        # Build children map (task -> list of tasks that depend on it)
-        children: dict[str, list[str]] = {node: [] for node in dag.nodes}
-        for child, parents in dag.edges.items():
-            for parent in parents:
-                children.setdefault(parent, []).append(child)
-
-        for tname, trec in runrec.tasks.items():
-            if trec.status != "SUCCESS" or trec.result is None:
-                continue
-            spec = self._registry.get(tname)
-            if spec.retain_result:
-                continue
-            # Release if all children are no longer PENDING (launched, done, or skipped)
-            if all(runrec.tasks[c].status != "PENDING" for c in children.get(tname, [])):
-                self._state.clear_result(run_id, tname)
