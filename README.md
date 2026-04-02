@@ -1,9 +1,9 @@
 flowrun
 =======
 
-`flowrun` is a lightweight async DAG orchestrator for small to medium ETL pipelines.
-It is designed for low operational overhead and low complexity workloads (for example
-Polars pipelines, API ingest + transform + load jobs, or periodic data sync tasks).
+`flowrun` is a compact DAG execution engine for small to medium ETL jobs.
+It is designed for local, code-first workflows such as API ingest -> Polars transform
+-> validation/quarantine -> sink, plus sequential micro-batch data sync jobs.
 
 Core ideas:
 
@@ -11,11 +11,47 @@ Core ideas:
 - Keep runtime dependency-free: stdlib-based implementation.
 - Keep behavior explicit: retries, timeouts, skip semantics, run reports.
 
+## Positioning
+
+`flowrun` is a good fit when your workflow lives inside one Python process,
+the DAG is declared in code, and you want a small execution layer around ETL
+functions rather than a full workflow platform.
+
+It is not positioned as a durable scheduler, distributed orchestrator, or
+policy-heavy control plane. If you need persistent workers, cron scheduling,
+cross-process recovery guarantees, dynamic scaling, or extensive execution
+policies, you should use a heavier system.
+
+## Strengths
+
+- Clear fit for API -> transform -> validate -> load pipelines.
+- Works well with Polars-style business logic and thin orchestration wrappers.
+- Small API surface and low operational overhead.
+- Explicit execution model: retries, DAG validation, run reports, hooks, resume, and subgraph runs.
+- Good match for sequential micro-batch jobs where context such as `batch_id`, `source`, or `window` matters.
+
+## Tradeoffs
+
+- In-process execution only; no distributed workers or durable queueing.
+- No built-in scheduling layer; run triggering belongs outside the framework.
+- Recovery is scoped to stored run state in the current process, not a full external orchestration backend.
+- Retry behavior is intentionally simple; API-specific backoff and resilience policies belong in user code.
+- Best for low-to-moderate workflow complexity, not platform-scale orchestration.
+
 ## Installation
 
 ```bash
 pip install flowrun-dag
 ```
+
+Optional example dependencies:
+
+```bash
+pip install "flowrun-dag[examples]"
+```
+
+This installs the libraries used by the example workflows, including Polars and
+Pandera's Polars integration.
 
 > The import name remains `flowrun`:
 > ```python
@@ -28,6 +64,7 @@ For development:
 git clone https://github.com/Mg30/flowrun.git
 cd flowrun
 uv sync --group dev
+uv sync --group dev --extra examples
 uv run pytest -q
 ```
 
@@ -47,19 +84,21 @@ class Deps:
     source_path: str
 
 
-@engine.task(name="extract", dag="daily_etl")
+# Task names default to the Python function name. Use name="daily_extract"
+# only when you need an explicit alias or a stable external task name.
+@engine.task(dag="daily_etl")
 def extract(context: RunContext[Deps]) -> list[dict]:
     # In real jobs, read from file/API/db
     return [{"id": 1, "amount": 10}, {"id": 2, "amount": 15}]
 
 
-@engine.task(name="transform", dag="daily_etl", deps=[extract])
+@engine.task(dag="daily_etl", deps=[extract])
 def transform(extract: list[dict]) -> dict[str, int]:
     total = sum(row["amount"] for row in extract)
     return {"rows": len(extract), "total": total}
 
 
-@engine.task(name="load", dag="daily_etl", deps=[transform])
+@engine.task(dag="daily_etl", deps=[transform])
 def load(transform: dict[str, int]) -> str:
     # Persist results
     return f"loaded rows={transform['rows']} total={transform['total']}"
@@ -79,7 +118,7 @@ asyncio.run(main())
 
 ## Concepts
 
-- Task: Python callable registered with `@engine.task(...)` or `@task(...)`.
+- Task: Python callable registered with `@engine.task(...)`.
 - DAG: namespace (`dag="name"`) plus dependency edges between tasks.
 - Run: one execution instance of a DAG (`run_id`).
 - State store: tracks run/task status, timing, errors, and results.
@@ -112,7 +151,7 @@ Parameters:
 - `max_parallel`: max concurrent scheduled tasks, must be `>= 1`.
 - `logger`: optional `logging.Logger` used across components.
 - `hooks`: optional list of `RunHook` handlers.
-- `state_store`: optional custom state store (`StateStoreProtocol`).
+- `state_store`: optional custom in-memory state store instance.
 
 Returns: configured `Engine`.
 
@@ -121,6 +160,7 @@ Returns: configured `Engine`.
 Run control:
 
 - `await engine.run_once(dag_name, context=None) -> str`
+- `await engine.run_many(dag_name, contexts) -> list[str]`
 - `await engine.resume(run_id, from_tasks=None, context=None) -> str`
 - `await engine.run_subgraph(dag_name, targets, context=None) -> str`
 
@@ -145,7 +185,7 @@ Resource lifecycle:
 Preferred style (bound to engine registry):
 
 ```python
-@engine.task(name="task_a", dag="etl", deps=[...], timeout_s=30.0, retries=1, retain_result=True)
+@engine.task(name="task_a", dag="etl", deps=[...], retries=1)
 def task_a(...):
     ...
 ```
@@ -154,10 +194,17 @@ Arguments:
 
 - `name`: optional, defaults to function name.
 - `dag`: DAG namespace for selection via `run_once(dag_name)`.
-- `deps`: list of task names or decorated task callables.
-- `timeout_s`: per-attempt timeout (`None` disables timeout).
+- `deps`: optional list of task names or decorated task callables. When omitted,
+  required parameter names that match already-registered task names are inferred.
+- `timeout_s`: per-attempt timeout for async tasks (`None` disables timeout).
 - `retries`: retry count after failures.
-- `retain_result`: if `False`, clear result from state when safe.
+
+For synchronous tasks, configure timeouts in the client you call inside the task.
+`flowrun` intentionally rejects framework-level timeouts for sync callables because
+thread-based timeouts cannot safely stop side effects.
+
+Use explicit `deps=` when you need `upstream`, dependency aliases, non-identifier
+task names, or forward references to tasks registered later.
 
 Avoid repeating `dag=...` with a DAG-scoped container:
 
@@ -168,7 +215,7 @@ etl = engine.dag("daily_etl")
 def extract() -> list[int]:
     return [1, 2, 3]
 
-@etl.task(name="sum_values", deps=[extract])
+@etl.task(name="sum_values")
 def sum_values(extract: list[int]) -> int:
     return sum(extract)
 
@@ -178,40 +225,28 @@ run_id = await etl.run_once()
 Available on the scope:
 
 - `etl.task(...)`
-- `etl.task_template(...)`
 - `await etl.run_once(context=None)`
+- `await etl.run_many(contexts)`
 - `await etl.run_subgraph(targets, context=None)`
 - `etl.validate()`, `etl.display()`, `etl.list_tasks()`
 
-Also available as global decorator:
-
-```python
-from flowrun import task, TaskRegistry
-
-registry = TaskRegistry()
-token = registry.activate()
-
-@task
-def my_task():
-    return 1
-
-TaskRegistry.deactivate(token)
-```
-
-Notes:
-
-- `@task(...)`, `@task`, and `@task("name", ...)` are supported.
-- If using global `@task`, provide `registry=...` or activate one.
-
 ### Dependency result injection
 
-Named dependency injection:
+Named dependency injection with inferred dependencies:
 
 ```python
 @engine.task(name="extract", dag="etl")
 def extract() -> list[int]:
     return [1, 2, 3]
 
+@engine.task(name="sum_values", dag="etl")
+def sum_values(extract: list[int]) -> int:
+    return sum(extract)
+```
+
+Explicit dependencies remain available when you prefer the edges in the decorator:
+
+```python
 @engine.task(name="sum_values", dag="etl", deps=[extract])
 def sum_values(extract: list[int]) -> int:
     return sum(extract)
@@ -241,18 +276,43 @@ def pull(context: RunContext[Deps]) -> dict:
     return {"base": context.api_base}
 ```
 
-### Task templates
-
-Register parameterized task variants.
+`RunContext` can also carry an ambient deadline or cancellation event when a task
+needs to pass timeouts into a client or stop cooperatively at a safe checkpoint.
 
 ```python
-def fetch_table(*, table: str) -> str:
-    return f"select * from {table}"
+import threading
 
-tpl = engine.task_template(fetch_table, dag="etl")
-tpl.bind("fetch_users", table="users")
-tpl.bind("fetch_orders", table="orders")
+cancel_event = threading.Event()
+ctx = RunContext(Deps(api_base="https://api.example.com"))
+ctx = ctx.with_deadline_s(30.0).with_cancel_event(cancel_event)
+
+@engine.task(name="pull", dag="etl")
+def pull(context: RunContext[Deps]) -> dict:
+    context.raise_if_cancelled()
+    timeout_s = context.time_remaining_s() or 10.0
+    return call_api(context.api_base, timeout=timeout_s)
 ```
+
+This is optional. Most tasks do not need these helpers.
+
+### Run metadata
+
+Attach lightweight reporting metadata to a run through `RunContext`.
+
+```python
+ctx = RunContext(Deps(api_base="https://api.example.com")).with_metadata(
+    batch_id=42,
+    source="users_api",
+    window="2026-04-01",
+)
+
+run_id = await engine.run_once("etl", context=ctx)
+report = engine.get_run_report(run_id)
+print(report["metadata"])  # {"batch_id": 42, "source": "users_api", ...}
+```
+
+This is useful for ETL-style identifiers such as batch ids, partitions, sources,
+or time windows without adding more orchestration parameters.
 
 ## Execution Semantics
 
@@ -269,6 +329,7 @@ Build-time validation catches:
 - Missing dependencies.
 - Cross-DAG dependencies.
 - Cycles.
+- Required task parameters that do not match an inferred or explicit dependency, `RunContext`, or `upstream`.
 
 Missing dependency errors include close-match suggestions when available.
 
@@ -279,15 +340,9 @@ Missing dependency errors include close-match suggestions when available.
 
 ### Timeouts
 
-- Applied per attempt.
+- Applied per attempt for async tasks.
 - Async tasks use `asyncio.wait_for`.
-- Sync tasks run in executor and are awaited with timeout.
-
-### Result retention
-
-- `retain_result=True` (default): keep result in state.
-- `retain_result=False`: clear result once all downstream consumers are launched/done.
-- Useful to reduce memory when passing larger intermediate objects.
+- Sync tasks do not support framework-level timeouts; use client/library timeouts inside the task.
 
 ## Run Report Format
 
@@ -297,6 +352,7 @@ Missing dependency errors include close-match suggestions when available.
 {
   "run_id": "...",
   "dag_name": "...",
+  "metadata": {"batch_id": 42, "source": "users_api"},
   "created_at": 0.0,
   "finished_at": 0.0,
   "status": "SUCCESS",  # SUCCESS | FAILED | RUNNING
@@ -353,26 +409,93 @@ In-memory (default):
 - `StateStore` / `InMemoryStateStore`
 - Fast, process-local, ephemeral.
 
-SQLite persistent backend:
-
-- `SqliteStateStore(db_path, serializer=..., cache_ttl_s=None, recover=False)`
-- Persists run and task state.
-- Optional crash recovery marks orphaned `RUNNING` tasks as failed.
-
-Serialization options for persisted results:
-
-- `JsonSerializer` (default for SQLite backend)
-- `PickleSerializer`
-- custom `ResultSerializer` implementation
-
 ## Practical ETL Patterns
 
 ### Small Polars pipeline pattern
 
 - Keep each task focused (`extract`, `transform`, `load`).
-- Set `retain_result=False` on large intermediate transforms.
 - Use `retries` on flaky IO tasks, not pure transforms.
 - Keep `max_parallel` modest for predictable resource use.
+
+### Sequential micro-batch pattern
+
+When chunks are fetched outside the DAG, run the full DAG once per chunk in a
+sequential loop. This is a micro-batch pattern, not end-to-end streaming.
+
+```python
+import asyncio
+from dataclasses import dataclass
+
+from flowrun import RunContext, build_default_engine
+
+engine = build_default_engine(max_workers=4, max_parallel=2)
+etl = engine.dag("users")
+
+
+@dataclass(frozen=True)
+class ChunkDeps:
+    chunk_index: int
+    rows: list[dict[str, int]]
+
+
+@etl.task()
+def input_chunk(context: RunContext[ChunkDeps]) -> list[dict[str, int]]:
+    return context.rows
+
+
+@etl.task(deps=[input_chunk])
+def transform_chunk(input_chunk: list[dict[str, int]]) -> dict[str, int]:
+    return {
+        "rows": len(input_chunk),
+        "total": sum(row["value"] for row in input_chunk),
+    }
+
+
+@etl.task(deps=[transform_chunk])
+def load_chunk(transform_chunk: dict[str, int]) -> str:
+    return f"loaded rows={transform_chunk['rows']} total={transform_chunk['total']}"
+
+
+async def chunk_contexts():
+    for chunk_index in range(3):
+        rows = [{"value": chunk_index * 10 + offset} for offset in range(3)]
+        yield RunContext(ChunkDeps(chunk_index=chunk_index, rows=rows)).with_metadata(
+            batch_id=chunk_index,
+            source="users_api",
+        )
+
+
+async def main() -> None:
+    async with engine:
+        etl.validate()
+        run_ids = await etl.run_many(chunk_contexts())
+        print(run_ids)
+
+
+asyncio.run(main())
+```
+
+This keeps chunk fetching outside the DAG while preserving plain task boundaries
+inside the graph.
+
+### Layered Polars workflow pattern
+
+For teams that need clearer structure, keep undecorated business functions in one
+layer and add a thin Flowrun orchestration layer on top.
+
+Recommended split:
+
+- async extraction functions that fetch raw endpoint payloads
+- pure Polars functions that normalise each dataset independently
+- Pandera validation functions that split validated and rejected rows
+- quarantine sink functions for rejected rows
+- a pure join/aggregation function that combines the processed frames
+- a plain sink function
+- small task wrappers that call those functions and express orchestration only
+
+See `examples/polars_workflow_demo.py` for a concrete example with two fake API
+endpoints fetched in parallel, separate Polars processing branches, schema
+validation with quarantine, a join step, and a fake sink.
 
 ### Re-run from a checkpoint task
 
@@ -415,12 +538,10 @@ Top-level exports in `flowrun`:
 
 - `Engine`, `build_default_engine`
 - `RunContext`
-- `task`, `task_template`, `TaskSpec`, `TaskRegistry`
+- `TaskSpec`, `TaskRegistry`
 - `SchedulerConfig`
 - `RunHook`, `fn_hook`
-- `StateStore`, `InMemoryStateStore`, `StateStoreProtocol`
-- `SqliteStateStore`
-- `JsonSerializer`, `PickleSerializer`, `ResultSerializer`
+- `StateStore`, `InMemoryStateStore`
 
 ## License
 
