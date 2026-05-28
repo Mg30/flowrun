@@ -337,10 +337,10 @@ async def main() -> None:
     )
 
     async with engine:
-        etl.validate()
-        print(etl.display())
-        run_id = await etl.run_once(context=context)
-        report = engine.get_run_report(run_id)
+        pipeline = etl.build()
+        print(pipeline.display())
+        run_id = await pipeline.run_once(context=context)
+        report = pipeline.get_run_report(run_id)
 
     print("\n=== FINAL SUMMARY ===")
     print(report["tasks"]["build_summary"]["result"])

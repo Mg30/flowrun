@@ -72,12 +72,12 @@ async def fetch_chunk_contexts():
 async def main() -> None:
     """Run the same DAG once per chunk from the async source."""
     async with engine:
-        etl.validate()
-        run_ids = await etl.run_many(fetch_chunk_contexts())
+        pipeline = etl.build()
+        run_ids = await pipeline.run_many(fetch_chunk_contexts())
 
         print("=== MICRO-BATCH RUNS ===")
         for run_id in run_ids:
-            report = engine.get_run_report(run_id)
+            report = pipeline.get_run_report(run_id)
             batch_id = report["metadata"]["batch_id"]
             print(f"batch={batch_id}  {run_id}: {report['tasks']['load_chunk']['result']}")
 

@@ -125,11 +125,12 @@ def store_results(process_data: ProcessDataResult) -> str:
 async def main():
     """Run the demonstration DAG once and print the resulting report."""
     async with engine:
-        tree = engine.display_dag(dag_name="demo_dag")
+        pipeline = engine.build("demo_dag")
+        tree = pipeline.display()
         print(tree)
 
-        run_id = await engine.run_once(dag_name="demo_dag", context=demo_context)
-        report = engine.get_run_report(run_id)
+        run_id = await pipeline.run_once(context=demo_context)
+        report = pipeline.get_run_report(run_id)
 
     print("\n=== RUN REPORT ===")
     print(f"run_id      : {report['run_id']}")
@@ -147,13 +148,14 @@ async def main():
 async def demo_resume():
     """Show resuming a failed run (only failed/skipped tasks re-execute)."""
     async with engine:
+        pipeline = engine.build("demo_dag")
         # First run — will succeed normally
-        run_id = await engine.run_once(dag_name="demo_dag", context=demo_context)
+        run_id = await pipeline.run_once(context=demo_context)
         print(f"\n--- Original run finished: {run_id}")
 
         # Resume from a specific task (re-runs it + downstream)
         resumed_id = await engine.resume(run_id, from_tasks=["process_data"], context=demo_context)
-        report = engine.get_run_report(resumed_id)
+        report = pipeline.get_run_report(resumed_id)
         print(f"\n--- Resumed run finished: {resumed_id}")
         for tname, info in report["tasks"].items():
             print(f"  {tname}: {info['status']}  (attempt {info['attempt']})")
@@ -162,18 +164,16 @@ async def demo_resume():
 async def demo_subgraph():
     """Show running only a sub-graph of the DAG."""
     async with engine:
+        pipeline = engine.build("demo_dag")
         # Run only process_data and its ancestors (fetch_api, fetch_metadata)
-        run_id = await engine.run_subgraph(
-            dag_name="demo_dag",
-            targets=["process_data"],
-            context=demo_context,
-        )
-        report = engine.get_run_report(run_id)
+        run_id = await pipeline.run_subgraph(targets=["process_data"], context=demo_context)
+        report = pipeline.get_run_report(run_id)
         print(f"\n--- Sub-graph run finished: {run_id}")
         for tname, info in report["tasks"].items():
             print(f"  {tname}: {info['status']}  (attempt {info['attempt']})")
         # store_results is excluded — not in the sub-graph
-        assert "store_results" not in report["tasks"]
+        if "store_results" in report["tasks"]:
+            raise RuntimeError("store_results should not be part of the sub-graph")
         print("  (store_results was NOT part of the sub-graph)")
 
 
