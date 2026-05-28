@@ -244,16 +244,19 @@ async def test_hooks_fire_on_retry():
 
 
 @pytest.mark.asyncio
-async def test_hooks_via_build_default_engine():
-    """Hooks passed to build_default_engine should reach the scheduler."""
-    from flowrun.engine import build_default_engine
+async def test_hooks_via_pipeline():
+    """Hooks passed to Pipeline should reach the scheduler."""
+    from flowrun import Pipeline
 
     hook = RecordingHook()
-    engine = build_default_engine(hooks=[hook])
-    engine.registry.register(TaskSpec(name="t1", func=lambda: None))
+    pipeline = Pipeline("via_hooks", hooks=[hook])
 
-    async with engine:
-        await engine.run_once("via_hooks")
+    @pipeline.task(name="t1")
+    def t1() -> None:
+        return None
+
+    async with pipeline:
+        await pipeline.run_once()
 
     event_names = [name for name, _ev in hook.events]
     assert "on_dag_start" in event_names

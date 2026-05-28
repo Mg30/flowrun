@@ -402,7 +402,7 @@ class Engine:
     def build(self, dag_name: str) -> Pipeline:
         """Build a DAG into an executable pipeline snapshot."""
         dag = self._dag_builder.build(dag_name=dag_name)
-        return Pipeline(self, dag, self._copy_registry_for_nodes(dag.nodes, dag_name=dag.name))
+        return Pipeline._from_built(self, dag, self._copy_registry_for_nodes(dag.nodes, dag_name=dag.name))
 
     def get_run_report(self, run_id: str) -> dict[str, Any]:
         """

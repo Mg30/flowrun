@@ -366,13 +366,12 @@ def task(
     retries : int
         Number of times to retry on failure (0 = no retries).
     dag : str | None
-        Optional DAG namespace used by ``Engine.run_once(dag_name=...)`` to
-        select only tasks belonging to that DAG.
+        Optional DAG namespace used internally when a pipeline registers tasks.
     registry : TaskRegistry | None
         Registry to register with. Required when using ``task(...)`` directly.
     """
     if registry is None:
-        raise TypeError("task(...): registry= is required. Prefer engine.task(...) or etl.task(...).")
+        raise TypeError("task(...): registry= is required. Prefer pipeline.task(...).")
 
     def wrapper(func: Callable[..., Any]):
         dep_names = _normalize_deps(deps) if deps is not None else _infer_required_dep_names(func, registry, dag=dag)
