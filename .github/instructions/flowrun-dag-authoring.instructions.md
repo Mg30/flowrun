@@ -25,14 +25,15 @@ cross-process recovery, or platform-style retry policies.
 
 ## Principal API Features
 
-### Engine setup
+### Pipeline setup
 
-Create the engine with the public API:
+Create a pipeline with the public API:
 
 ```python
-from flowrun import build_default_engine
+from flowrun import Pipeline
 
-engine = build_default_engine(
+pipeline = Pipeline(
+    "sales_summary",
     max_workers=4,
     max_parallel=3,
     logger=logger,
@@ -44,21 +45,15 @@ engine = build_default_engine(
 - `max_parallel` caps concurrent scheduled work.
 - `hooks` accepts `RunHook` handlers, often created with `fn_hook(...)`.
 
-### DAG scoping
+### Task registration
 
-Prefer a DAG scope instead of repeating `dag="..."` on every task:
+Register tasks directly on the pipeline:
 
 ```python
-etl = engine.dag("sales_summary")
-
-@etl.task()
+@pipeline.task()
 def extract() -> list[dict]:
     ...
 ```
-
-Use `engine.task(dag="...")` only when a DAG-scoped facade would make the code less clear.
-
-### Task registration
 
 - Task names default to the Python function name.
 - Only set `name="..."` when you need an alias or a stable orchestration name during a refactor.
@@ -94,7 +89,10 @@ Use `RunContext[Deps]` for runtime dependencies and run metadata.
 ```python
 from dataclasses import dataclass
 
-from flowrun import RunContext
+from flowrun import Pipeline, RunContext
+
+
+pipeline = Pipeline("users_ingest")
 
 
 @dataclass(frozen=True)
@@ -103,7 +101,7 @@ class ApiDeps:
     auth_token: str
 
 
-@etl.task(timeout_s=3.0)
+@pipeline.task(timeout_s=3.0)
 async def fetch_users(context: RunContext[ApiDeps]) -> list[dict]:
     return await fetch_users_records(api_base=context.api_base, auth_token=context.auth_token)
 ```
@@ -115,14 +113,14 @@ async def fetch_users(context: RunContext[ApiDeps]) -> list[dict]:
 
 ### Execution helpers
 
-Prefer the DAG-scoped helpers when writing examples or application code:
+Prefer pipeline helpers when writing examples or application code:
 
-- `etl.validate()` before execution
-- `await etl.run_once(context=context)` for one run
-- `await etl.run_many(contexts)` for sequential micro-batches
-- `await etl.run_subgraph(targets=[...], context=context)` for a partial DAG
-- `engine.resume(run_id, from_tasks=[...], context=context)` for rerunning failed or selected downstream work
-- `engine.get_run_report(run_id)` to inspect task statuses, results, errors, and metadata
+- `pipeline.validate()` before execution
+- `await pipeline.run_once(context=context)` for one run
+- `await pipeline.run_many(contexts)` for sequential micro-batches
+- `await pipeline.run_subgraph(targets=[...], context=context)` for a partial DAG
+- `await pipeline.resume(run_id, from_tasks=[...], context=context)` for rerunning failed or selected downstream work
+- `pipeline.get_run_report(run_id)` to inspect task statuses, results, errors, and metadata
 
 ### Hooks
 
@@ -166,10 +164,10 @@ Use this style when the goal is to explain Flowrun basics rather than showcase a
 Follow `examples/micro_batch_demo.py` when each batch should run the same DAG with a different
 context.
 
-- Build one DAG with `etl = engine.dag("...")`.
+- Build one DAG with `pipeline = Pipeline("...")`.
 - Expose the current batch through `RunContext`.
 - Generate contexts outside the DAG.
-- Use `await etl.run_many(contexts)` for sequential processing.
+- Use `await pipeline.run_many(contexts)` for sequential processing.
 - Attach batch metadata with `with_metadata(...)` so the run report carries identifiers such as `batch_id`.
 
 This pattern is for orchestration over batches, not for dynamic task generation inside the DAG.
@@ -196,7 +194,7 @@ Useful conventions from that example:
 When authoring a new Polars workflow, prefer wrappers like this:
 
 ```python
-@etl.task()
+@pipeline.task()
 def validate_users(prepare_users: pl.DataFrame) -> ValidationSplit[UsersSchema]:
     return validate_frame(prepare_users, UsersSchema, business_object="users")
 ```
@@ -205,12 +203,12 @@ That keeps schema logic in reusable helpers and the DAG node focused on orchestr
 
 ## Rules For Generated Flowrun Code
 
-- Import from Flowrun's public API: `RunContext`, `build_default_engine`, `fn_hook`, and DAG-scope helpers.
+- Import from Flowrun's public API: `Pipeline`, `RunContext`, and `fn_hook`.
 - Use Python 3.12-compatible typing and syntax.
 - Keep task names valid Python identifiers when relying on inferred dependencies.
 - Register upstream tasks before downstream tasks when using inferred dependency names.
 - Call `validate()` before running example DAGs unless the surrounding code already guarantees validation.
-- Return structured values that are easy to inspect in `engine.get_run_report(...)`.
+- Return structured values that are easy to inspect in `pipeline.get_run_report(...)`.
 - Use `TypedDict`, `dataclass`, or typed DataFrame aliases instead of loose `dict[str, Any]` when practical.
 - Prefer `run_many()` over manually looping `run_once()` when modeling sequential micro-batch execution.
 - Do not add framework-level timeout settings to synchronous tasks.

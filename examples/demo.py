@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypedDict
 
-from flowrun import RunContext, build_default_engine, fn_hook
+from flowrun import Pipeline, RunContext, fn_hook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(name)-22s  %(levelname)-7s  %(message)s")
 logger = logging.getLogger("demo_etl")
@@ -18,7 +18,7 @@ demo_hook = fn_hook(
     on_dag_end=lambda e: print(f"\n✓ DAG {e.dag_name!r} finished  run_id={e.run_id}"),
 )
 
-engine = build_default_engine(max_workers=4, max_parallel=3, logger=logger, hooks=[demo_hook])
+pipeline = Pipeline("demo_dag", max_workers=4, max_parallel=3, logger=logger, hooks=[demo_hook])
 
 
 @dataclass(frozen=True)
@@ -66,8 +66,7 @@ class ProcessDataResult(TypedDict):
 
 # Task names default to the function name. Use name="fetch_api_v2" only if the
 # orchestration name should stay stable while the Python function is renamed.
-@engine.task(
-    dag="demo_dag",
+@pipeline.task(
     deps=[],
     retries=1,
 )
@@ -81,8 +80,7 @@ def fetch_api(ctx: RunContext[DemoDeps]):
     return FetchApiResult(data=[1, 2, 3], base_url=session["base_url"])
 
 
-@engine.task(
-    dag="demo_dag",
+@pipeline.task(
     deps=[],
     timeout_s=5.0,
 )
@@ -93,8 +91,7 @@ async def fetch_metadata():
     return FetchMetadataResult(source="meta-service", version=42)
 
 
-@engine.task(
-    dag="demo_dag",
+@pipeline.task(
     deps=[fetch_api, fetch_metadata],
 )
 def process_data(fetch_api: FetchApiResult, fetch_metadata: FetchMetadataResult) -> ProcessDataResult:
@@ -110,8 +107,7 @@ def process_data(fetch_api: FetchApiResult, fetch_metadata: FetchMetadataResult)
     )
 
 
-@engine.task(
-    dag="demo_dag",
+@pipeline.task(
     deps=[process_data],
 )
 def store_results(process_data: ProcessDataResult) -> str:
@@ -124,8 +120,7 @@ def store_results(process_data: ProcessDataResult) -> str:
 
 async def main():
     """Run the demonstration DAG once and print the resulting report."""
-    async with engine:
-        pipeline = engine.build("demo_dag")
+    async with pipeline:
         tree = pipeline.display()
         print(tree)
 
@@ -147,14 +142,13 @@ async def main():
 
 async def demo_resume():
     """Show resuming a failed run (only failed/skipped tasks re-execute)."""
-    async with engine:
-        pipeline = engine.build("demo_dag")
+    async with pipeline:
         # First run — will succeed normally
         run_id = await pipeline.run_once(context=demo_context)
         print(f"\n--- Original run finished: {run_id}")
 
         # Resume from a specific task (re-runs it + downstream)
-        resumed_id = await engine.resume(run_id, from_tasks=["process_data"], context=demo_context)
+        resumed_id = await pipeline.resume(run_id, from_tasks=["process_data"], context=demo_context)
         report = pipeline.get_run_report(resumed_id)
         print(f"\n--- Resumed run finished: {resumed_id}")
         for tname, info in report["tasks"].items():
@@ -163,8 +157,7 @@ async def demo_resume():
 
 async def demo_subgraph():
     """Show running only a sub-graph of the DAG."""
-    async with engine:
-        pipeline = engine.build("demo_dag")
+    async with pipeline:
         # Run only process_data and its ancestors (fetch_api, fetch_metadata)
         run_id = await pipeline.run_subgraph(targets=["process_data"], context=demo_context)
         report = pipeline.get_run_report(run_id)

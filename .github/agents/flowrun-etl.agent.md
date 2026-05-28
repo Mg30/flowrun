@@ -44,20 +44,19 @@ If a user asks for those capabilities, keep the answer grounded: explain the lim
 
 Use Flowrun's public API:
 
-- `build_default_engine(...)`
+- `Pipeline(...)`
 - `InMemoryStateStore` and `StateStore`
-- `engine.dag(name)` and `DagScope.task(...)`
-- `engine.task(dag="...")` when a scope is not appropriate
+- `pipeline.task(...)`
 - `RunContext[...]`
 - `RunCancelledError`
 - `RunHook`
 - `fn_hook(...)`
-- `etl.validate()` or `engine.validate(dag_name)`
-- `await etl.run_once(context=context)`
-- `await etl.run_many(contexts)`
-- `await etl.run_subgraph(targets=[...], context=context)`
-- `await engine.resume(run_id, from_tasks=[...], context=context)`
-- `engine.get_run_report(run_id)`
+- `pipeline.validate()`
+- `await pipeline.run_once(context=context)`
+- `await pipeline.run_many(contexts)`
+- `await pipeline.run_subgraph(targets=[...], context=context)`
+- `await pipeline.resume(run_id, from_tasks=[...], context=context)`
+- `pipeline.get_run_report(run_id)`
 
 ## RunContext API Knowledge
 
@@ -109,11 +108,10 @@ Use this as the default minimal Flowrun pattern when the user wants a clean DAG 
 import asyncio
 from dataclasses import dataclass
 
-from flowrun import RunContext, build_default_engine
+from flowrun import Pipeline, RunContext
 
 
-engine = build_default_engine(max_workers=4, max_parallel=2)
-etl = engine.dag("daily_etl")
+pipeline = Pipeline("daily_etl", max_workers=4, max_parallel=2)
 
 
 @dataclass(frozen=True)
@@ -121,12 +119,12 @@ class Deps:
 	source_name: str
 
 
-@etl.task()
+@pipeline.task()
 def extract(context: RunContext[Deps]) -> list[dict[str, int]]:
 	return [{"id": 1, "amount": 10}, {"id": 2, "amount": 15}]
 
 
-@etl.task()
+@pipeline.task()
 def transform(extract: list[dict[str, int]]) -> dict[str, int]:
 	return {
 		"rows": len(extract),
@@ -134,17 +132,17 @@ def transform(extract: list[dict[str, int]]) -> dict[str, int]:
 	}
 
 
-@etl.task(deps=[transform])
+@pipeline.task(deps=[transform])
 def load(transform: dict[str, int]) -> str:
 	return f"loaded rows={transform['rows']} total={transform['total']}"
 
 
 async def main() -> None:
 	context = RunContext(Deps(source_name="demo"))
-	async with engine:
-		etl.validate()
-		run_id = await etl.run_once(context=context)
-		report = engine.get_run_report(run_id)
+	async with pipeline:
+		pipeline.validate()
+		run_id = await pipeline.run_once(context=context)
+		report = pipeline.get_run_report(run_id)
 		print(report["tasks"]["load"]["result"])
 
 
@@ -163,7 +161,7 @@ Flowrun hooks are synchronous lifecycle callbacks. They are useful for lightweig
 
 Important behavior:
 
-- Hooks are registered through `build_default_engine(hooks=[...])`.
+- Hooks are registered through `Pipeline("name", hooks=[...])`.
 - Use `fn_hook(...)` for small function-based handlers.
 - Use `RunHook` subclasses when you want a reusable hook object.
 - Hook exceptions are caught and logged; they do not crash the scheduler.
@@ -182,7 +180,7 @@ Supported hook events:
 Function-style example:
 
 ```python
-from flowrun import build_default_engine, fn_hook
+from flowrun import Pipeline, fn_hook
 
 
 hook = fn_hook(
@@ -191,7 +189,7 @@ hook = fn_hook(
 	on_dag_end=lambda e: print(f"DAG finished: {e.dag_name} run_id={e.run_id}"),
 )
 
-engine = build_default_engine(max_workers=4, max_parallel=2, hooks=[hook])
+pipeline = Pipeline("etl", max_workers=4, max_parallel=2, hooks=[hook])
 ```
 
 Class-based example:
@@ -217,7 +215,7 @@ Important behavior:
 - `InMemoryStateStore` is the default state implementation.
 - `StateStore` is the public alias for the in-memory implementation.
 - Run and task state are ephemeral unless the project adds its own persistence layer around Flowrun.
-- `engine.get_run_report(run_id)` is the main inspection API for outcomes, metadata, errors, attempts, and task results.
+- `pipeline.get_run_report(run_id)` is the main inspection API for outcomes, metadata, errors, attempts, and task results.
 
 Task lifecycle knowledge:
 
@@ -237,12 +235,11 @@ Example:
 import asyncio
 from dataclasses import dataclass
 
-from flowrun import InMemoryStateStore, RunContext, build_default_engine
+from flowrun import InMemoryStateStore, Pipeline, RunContext
 
 
 state_store = InMemoryStateStore()
-engine = build_default_engine(max_workers=4, max_parallel=2, state_store=state_store)
-etl = engine.dag("state_demo")
+pipeline = Pipeline("state_demo", max_workers=4, max_parallel=2, state_store=state_store)
 
 
 @dataclass(frozen=True)
@@ -250,21 +247,21 @@ class Deps:
 	source: str
 
 
-@etl.task()
+@pipeline.task()
 def extract(context: RunContext[Deps]) -> list[int]:
 	return [1, 2, 3]
 
 
-@etl.task()
+@pipeline.task()
 def total(extract: list[int]) -> int:
 	return sum(extract)
 
 
 async def main() -> None:
-	async with engine:
-		etl.validate()
-		run_id = await etl.run_once(context=RunContext(Deps(source="demo")).with_metadata(batch_id=1))
-		report = engine.get_run_report(run_id)
+	async with pipeline:
+		pipeline.validate()
+		run_id = await pipeline.run_once(context=RunContext(Deps(source="demo")).with_metadata(batch_id=1))
+		report = pipeline.get_run_report(run_id)
 		print(report["status"])
 		print(report["metadata"])
 		print(report["tasks"]["total"]["result"])
@@ -277,13 +274,13 @@ When discussing state, be explicit that Flowrun is not a durable orchestration b
 
 ## Authoring Rules
 
-- Default to a DAG scope such as `etl = engine.dag("name")`.
+- Default to one named `Pipeline("name")` per DAG.
 - Keep task names as valid Python identifiers when relying on inferred dependencies.
 - Use dependency inference only when required parameter names exactly match already-registered task names.
 - Use explicit `deps=[...]` for forward references, aliases, non-identifier names, or when the graph edge should be explicit at the decorator.
 - Use `timeout_s=` only on `async def` tasks.
 - For synchronous tasks, place timeout behavior in the API or database client being called, not in Flowrun.
-- Prefer structured outputs that show up cleanly in `engine.get_run_report(...)`.
+- Prefer structured outputs that show up cleanly in `pipeline.get_run_report(...)`.
 - Validate DAGs before running them unless the surrounding code already guarantees it.
 - Keep hook handlers lightweight and side-effect aware.
 - Be explicit when run state is ephemeral and process-local.
@@ -305,11 +302,10 @@ import asyncio
 from dataclasses import dataclass
 from typing import TypedDict
 
-from flowrun import RunContext, build_default_engine
+from flowrun import Pipeline, RunContext
 
 
-engine = build_default_engine(max_workers=4, max_parallel=3)
-etl = engine.dag("api_ingest")
+pipeline = Pipeline("api_ingest", max_workers=4, max_parallel=3)
 
 
 @dataclass(frozen=True)
@@ -332,12 +328,12 @@ async def fetch_users_from_api(*, api_base: str, auth_token: str) -> list[UserRo
 	]
 
 
-@etl.task(timeout_s=3.0)
+@pipeline.task(timeout_s=3.0)
 async def fetch_users(context: RunContext[ApiDeps]) -> list[UserRow]:
 	return await fetch_users_from_api(api_base=context.api_base, auth_token=context.auth_token)
 
 
-@etl.task()
+@pipeline.task()
 def normalize_users(fetch_users: list[UserRow]) -> list[UserRow]:
 	return [{**row, "country": row["country"].upper()} for row in fetch_users]
 ```
@@ -374,11 +370,10 @@ import pandera.polars as pa
 import polars as pl
 from pandera.typing.polars import DataFrame, Series
 
-from flowrun import RunContext, build_default_engine
+from flowrun import Pipeline, RunContext
 
 
-engine = build_default_engine(max_workers=4, max_parallel=3)
-etl = engine.dag("polars_etl")
+pipeline = Pipeline("polars_etl", max_workers=4, max_parallel=3)
 
 
 @dataclass(frozen=True)
@@ -407,17 +402,17 @@ def validate_users_frame(frame: pl.DataFrame) -> ValidationSplit[UsersSchema]:
 	return ValidationSplit(validated=cast(DataFrame[UsersSchema], validated), rejected=rejected)
 
 
-@etl.task()
+@pipeline.task()
 def prepare_users(fetch_users: list[dict[str, object]]) -> pl.DataFrame:
 	return normalize_users(fetch_users)
 
 
-@etl.task()
+@pipeline.task()
 def validate_users(prepare_users: pl.DataFrame) -> ValidationSplit[UsersSchema]:
 	return validate_users_frame(prepare_users)
 
 
-@etl.task()
+@pipeline.task()
 def quarantine_users(validate_users: ValidationSplit[UsersSchema]) -> str:
 	return f"quarantine://users?rows={validate_users.rejected.height}"
 ```
@@ -432,11 +427,10 @@ Use `run_many()` when the same DAG should run once per batch or partition:
 import asyncio
 from dataclasses import dataclass
 
-from flowrun import RunContext, build_default_engine
+from flowrun import Pipeline, RunContext
 
 
-engine = build_default_engine(max_workers=4, max_parallel=2)
-etl = engine.dag("chunked_ingest")
+pipeline = Pipeline("chunked_ingest", max_workers=4, max_parallel=2)
 
 
 @dataclass(frozen=True)
@@ -445,12 +439,12 @@ class ChunkDeps:
 	rows: list[dict[str, int]]
 
 
-@etl.task()
+@pipeline.task()
 def input_chunk(context: RunContext[ChunkDeps]) -> list[dict[str, int]]:
 	return context.rows
 
 
-@etl.task()
+@pipeline.task()
 def summarize_chunk(input_chunk: list[dict[str, int]]) -> dict[str, int]:
 	return {"rows": len(input_chunk), "total": sum(row["value"] for row in input_chunk)}
 
@@ -466,11 +460,11 @@ async def contexts():
 
 
 async def main() -> None:
-	async with engine:
-		etl.validate()
-		run_ids = await etl.run_many(contexts())
+	async with pipeline:
+		pipeline.validate()
+		run_ids = await pipeline.run_many(contexts())
 		for run_id in run_ids:
-			print(engine.get_run_report(run_id)["metadata"]["batch_id"])
+			print(pipeline.get_run_report(run_id)["metadata"]["batch_id"])
 ```
 
 Prefer `run_many()` over writing a manual loop around `run_once()` when the intent is sequential micro-batch orchestration.
@@ -480,16 +474,16 @@ Prefer `run_many()` over writing a manual loop around `run_once()` when the inte
 Use `resume(...)` when a previous run exists and you want to preserve successful upstream work while re-running failed or selected downstream tasks.
 
 ```python
-new_run_id = await engine.resume(old_run_id, from_tasks=["transform"], context=context)
+new_run_id = await pipeline.resume(old_run_id, from_tasks=["transform"], context=context)
 ```
 
 Use `run_subgraph(...)` when only a target branch should execute together with its transitive dependencies.
 
 ```python
-run_id = await etl.run_subgraph(targets=["load"], context=context)
+run_id = await pipeline.run_subgraph(targets=["load"], context=context)
 ```
 
-Do not describe these features as durable checkpoint recovery across processes. They operate against the state available to the current engine and state store.
+Do not describe these features as durable checkpoint recovery across processes. They operate against the state available to the current pipeline runtime and state store.
 
 ## Constraints
 
