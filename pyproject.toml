@@ -1,6 +1,6 @@
 [project]
 name = "flowrun-dag"
-version = "1.0.0"
+version = "1.1.0"
 description = "A lightweight async DAG orchestrator for small to medium ETL pipelines"
 readme = "README.md"
 license = { text = "MIT" }
