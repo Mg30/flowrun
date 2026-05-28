@@ -177,6 +177,15 @@ async def test_engine_unknown_dag_raises():
 
 
 @pytest.mark.asyncio
+async def test_engine_empty_unscoped_dag_raises():
+    engine = build_default_engine(max_workers=1, max_parallel=1)
+
+    async with engine:
+        with pytest.raises(ValueError, match="has no registered tasks"):
+            await engine.run_once("missing")
+
+
+@pytest.mark.asyncio
 async def test_engine_validate_and_list_helpers():
     engine = build_default_engine(max_workers=2, max_parallel=2)
 
@@ -251,6 +260,51 @@ async def test_engine_dag_scope_registers_and_runs_without_repeating_dag():
     assert set(report["tasks"].keys()) == {"extract", "transform"}
     assert seen == ["extract", "transform"]
     assert etl.list_tasks() == ["extract", "transform"]
+
+
+@pytest.mark.asyncio
+async def test_engine_allows_same_task_names_in_different_dags():
+    engine = build_default_engine(max_workers=2, max_parallel=2)
+    etl_a = engine.dag("etl_a")
+    etl_b = engine.dag("etl_b")
+
+    @etl_a.task(name="extract")
+    def extract_a() -> str:
+        return "a"
+
+    @etl_b.task(name="extract")
+    def extract_b() -> str:
+        return "b"
+
+    async with engine:
+        run_a = await etl_a.run_once()
+        run_b = await etl_b.run_once()
+        report_a = engine.get_run_report(run_a)
+        report_b = engine.get_run_report(run_b)
+
+    assert report_a["tasks"]["extract"]["result"] == "a"
+    assert report_b["tasks"]["extract"]["result"] == "b"
+
+
+@pytest.mark.asyncio
+async def test_engine_injects_context_with_dependency_results():
+    engine = build_default_engine(max_workers=2, max_parallel=2)
+    etl = engine.dag("ctx_dep")
+
+    @etl.task(name="extract")
+    def extract() -> str:
+        return "ok"
+
+    @etl.task(name="consume", deps=[extract])
+    def consume(extract: str, context: RunContext[dict[str, str]]) -> str:
+        return extract + context.suffix
+
+    async with engine:
+        run_id = await etl.run_once(RunContext({"suffix": "!"}))
+        report = engine.get_run_report(run_id)
+
+    assert report["status"] == "SUCCESS"
+    assert report["tasks"]["consume"]["result"] == "ok!"
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,29 @@ def test_task_decorator_detects_required_context():
 
     assert spec.accepts_context is True
     assert spec.requires_context is True
+    assert spec.context_param_name == "ctx"
+
+
+def test_task_decorator_detects_postponed_context_annotations():
+    namespace = {"RunContext": RunContext, "TaskRegistry": TaskRegistry, "task": task}
+    exec(
+        """
+from __future__ import annotations
+
+registry = TaskRegistry()
+
+@task(name="needs_ctx", registry=registry)
+def needs_ctx(ctx: RunContext[dict[str, int]]):
+    return ctx.deps["value"]
+""",
+        namespace,
+    )
+
+    spec = namespace["registry"].get("needs_ctx")
+
+    assert spec.accepts_context is True
+    assert spec.requires_context is True
+    assert spec.context_param_name == "ctx"
 
 
 def test_task_decorator_normalizes_callable_dependencies():
@@ -100,3 +123,32 @@ def test_task_decorator_rejects_sync_timeouts():
         @task(name="sync_task", timeout_s=1.0, registry=registry)
         def sync_task() -> int:
             return 1
+
+
+def test_task_registry_allows_duplicate_task_names_in_different_dags():
+    registry = TaskRegistry()
+
+    @task(name="extract", dag="a", registry=registry)
+    def extract_a() -> int:
+        return 1
+
+    @task(name="extract", dag="b", registry=registry)
+    def extract_b() -> int:
+        return 2
+
+    assert registry.get("extract", "a").func is extract_a
+    assert registry.get("extract", "b").func is extract_b
+
+
+def test_task_registry_rejects_duplicate_task_names_in_same_dag():
+    registry = TaskRegistry()
+
+    @task(name="extract", dag="etl", registry=registry)
+    def extract_a() -> int:
+        return 1
+
+    with pytest.raises(ValueError, match="within a DAG namespace"):
+
+        @task(name="extract", dag="etl", registry=registry)
+        def extract_b() -> int:
+            return 2

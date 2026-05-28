@@ -121,9 +121,6 @@ class TaskExecutor:
                 )
 
             args: tuple[Any, ...] = ()
-            if context is not None and spec.accepts_context:
-                args = (context.with_deadline_s(timeout_s),)
-
             kwargs: dict[str, Any] = {}
             if spec.accepts_upstream:
                 kwargs["upstream"] = upstream_results or {}
@@ -135,6 +132,13 @@ class TaskExecutor:
                             f"Task '{spec.name}' expects upstream result '{dep_name}', but it was not provided."
                         )
                     kwargs[dep_name] = resolved[dep_name]
+
+            if context is not None and spec.accepts_context:
+                task_context = context.with_deadline_s(timeout_s)
+                if spec.context_param_name is not None and not spec.context_positional_only:
+                    kwargs[spec.context_param_name] = task_context
+                else:
+                    args = (task_context,)
 
             if spec.is_async():
                 # run coroutine directly with timeout

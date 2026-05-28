@@ -42,6 +42,10 @@ class DAG:
         set[str]
             The union of *tasks* and every task that transitively depends on them.
         """
+        missing = tasks - set(self.nodes)
+        if missing:
+            raise ValueError(f"Task {sorted(missing)[0]!r} is not in the DAG")
+
         children: dict[str, list[str]] = {n: [] for n in self.nodes}
         for child, parents in self.edges.items():
             for p in parents:
@@ -129,8 +133,9 @@ class DAGBuilder:
         ValueError
             If a task depends on another task that is not registered, or if a cyclic dependency is detected.
         """
-        all_tasks = self._registry.task_specs
-        scoped = {tname: spec for tname, spec in all_tasks.items() if spec.dag == dag_name}
+        all_specs = self._registry.specs
+        all_tasks = {spec.name: spec for spec in all_specs}
+        scoped = {spec.name: spec for spec in all_specs if spec.dag == dag_name}
         if scoped:
             tasks = scoped
         else:
@@ -144,7 +149,10 @@ class DAGBuilder:
                 raise ValueError(msg)
             # Legacy mode: if no task is explicitly scoped, preserve old behavior
             # where one registry corresponds to one DAG.
-            tasks = all_tasks
+            tasks = {spec.name: spec for spec in all_specs if spec.dag is None}
+
+        if not tasks:
+            raise ValueError(f"DAG {dag_name!r} has no registered tasks.")
 
         # 1. validate missing deps
         for tname, spec in tasks.items():
