@@ -131,6 +131,37 @@ async def test_task_executor_injects_named_dependency_results_when_declared():
 
 
 @pytest.mark.asyncio
+async def test_task_executor_injects_context_by_parameter_name_with_named_dependencies():
+    class Deps:
+        suffix = "!"
+
+    ctx = RunContext(Deps())
+
+    def child(root: str, context: RunContext[Deps]) -> str:
+        return root + context.suffix
+
+    spec = TaskSpec(
+        name="child",
+        func=child,
+        timeout_s=None,
+        accepts_context=True,
+        requires_context=True,
+        context_param_name="context",
+        named_deps=["root"],
+    )
+
+    thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        executor = TaskExecutor(executor=thread_pool)
+        result = await executor.run_once(spec, spec.timeout_s, ctx, {"root": "ok"})
+    finally:
+        thread_pool.shutdown(wait=True)
+
+    assert result.ok is True
+    assert result.result == "ok!"
+
+
+@pytest.mark.asyncio
 async def test_task_executor_derives_deadline_on_context():
     captured: dict[str, float | None] = {}
 

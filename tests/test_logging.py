@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from flowrun.dag import DAG
+from flowrun import Pipeline
 from flowrun.engine import build_default_engine
 from flowrun.executor import ExecutionResult, TaskExecutor
 from flowrun.scheduler import Scheduler, SchedulerConfig
@@ -173,8 +174,35 @@ async def test_scheduler_logs_skip():
 
 
 @pytest.mark.asyncio
-async def test_engine_logs_dag_start_and_finish():
-    """Engine should log DAG start and finish via the injected logger."""
+async def test_pipeline_logs_task_execution_with_injected_logger():
+    """Pipeline should propagate the injected logger to runtime components."""
+    records: list[logging.LogRecord] = []
+
+    class Collector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("test.pipeline.dag")
+    logger.handlers.clear()
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(Collector())
+
+    pipeline = Pipeline("test_dag", max_workers=1, max_parallel=1, logger=logger)
+
+    @pipeline.task(name="noop")
+    def noop() -> None:
+        return None
+
+    async with pipeline:
+        await pipeline.run_once()
+
+    messages = [r.getMessage() for r in records]
+    assert any("Task 'noop' succeeded" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_internal_engine_logs_dag_start_and_finish():
+    """The internal engine compatibility API still logs DAG start and finish."""
     records: list[logging.LogRecord] = []
 
     class Collector(logging.Handler):
@@ -187,10 +215,7 @@ async def test_engine_logs_dag_start_and_finish():
     logger.addHandler(Collector())
 
     engine = build_default_engine(max_workers=1, max_parallel=1, logger=logger)
-
-    # Register a trivial task so the DAG is valid
-    registry = engine.registry
-    registry.register(TaskSpec(name="noop", func=lambda: None))
+    engine.registry.register(TaskSpec(name="noop", func=lambda: None))
 
     async with engine:
         await engine.run_once("test_dag")

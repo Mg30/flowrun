@@ -1,20 +1,21 @@
 """Lightweight hook / callback system for flowrun.
 
 Users implement one or more methods of ``RunHook`` (or use the convenience
-``fn_hook`` factory for simple one-off callbacks) and pass them to the engine
+``fn_hook`` factory for simple one-off callbacks) and pass them to the pipeline
 or scheduler.  Hooks are invoked synchronously from the scheduler's event loop
 so they should be fast — offload heavy work (Slack HTTP calls, metric pushes)
 to a background task or thread inside your hook.
 
 Example
 -------
+>>> from flowrun import Pipeline
 >>> from flowrun.hooks import RunHook
 >>>
 >>> class SlackHook(RunHook):
 ...     def on_task_failure(self, event):
 ...         requests.post(WEBHOOK, json={"text": f"Task {event.task_name} failed!"})
 ...
->>> engine = build_default_engine(hooks=[SlackHook()])
+>>> pipeline = Pipeline("etl", hooks=[SlackHook()])
 """
 
 from __future__ import annotations

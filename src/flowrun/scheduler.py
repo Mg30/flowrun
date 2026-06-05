@@ -74,12 +74,26 @@ class Scheduler:
         self._executor = executor
         self._cfg = config
         self._log = logger or _default_logger
+        self._hook_handlers = list(hooks or [])
         self._hooks = HookDispatcher(hooks, logger=self._log)
 
     @property
     def executor(self) -> TaskExecutor:
         """Return the task executor used to run individual task specs."""
         return self._executor
+
+    def clone_with_registry(self, registry: TaskRegistry) -> "Scheduler":
+        """Return a scheduler sharing runtime components but resolving specs from *registry*."""
+        if registry is self._registry:
+            return self
+        return Scheduler(
+            registry=registry,
+            state_store=self._state,
+            executor=self._executor,
+            config=SchedulerConfig(max_parallel=self._cfg.max_parallel),
+            logger=self._log,
+            hooks=list(self._hook_handlers),
+        )
 
     async def run_dag_once(self, dag: DAG, context: RunContext[Any] | None = None, *, run_id: str | None = None) -> str:
         """Execute a DAG once, tracking task state and returning the run id.
@@ -143,7 +157,7 @@ class Scheduler:
                         ),
                     )
                 else:
-                    spec = self._registry.get(task_name)
+                    spec = self._registry.get(task_name, dag.name)
                     task_rec = self._state.get_run(run_id).tasks[task_name]
                     self._state.mark_failed(run_id, task_name, exec_res.error)
                     self._log.warning(
@@ -205,7 +219,7 @@ class Scheduler:
         task_name: str,
         context: RunContext[Any] | None,
     ) -> asyncio.Task:
-        spec = self._registry.get(task_name)
+        spec = self._registry.get(task_name, dag.name)
         runrec = self._state.get_run(run_id)
         upstream_results = {
             parent: runrec.tasks[parent].result
@@ -249,7 +263,10 @@ class Scheduler:
                 parents = dag.parents_of(tname)
                 bad_parent = any(
                     runrec.tasks[p].status in ("FAILED", "SKIPPED")
-                    and (runrec.tasks[p].status == "SKIPPED" or runrec.tasks[p].attempt > self._registry.get(p).retries)
+                    and (
+                        runrec.tasks[p].status == "SKIPPED"
+                        or runrec.tasks[p].attempt > self._registry.get(p, dag.name).retries
+                    )
                     for p in parents
                 )
                 if bad_parent:

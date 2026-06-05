@@ -96,6 +96,10 @@ class TestDescendantsOf:
     def test_multiple_seeds(self):
         assert DIAMOND_DAG.descendants_of({"B", "C"}) == {"B", "C", "D"}
 
+    def test_unknown_seed_raises(self):
+        with pytest.raises(ValueError, match="not in the DAG"):
+            DIAMOND_DAG.descendants_of({"NOPE"})
+
 
 # ---------------------------------------------------------------------------
 # StateStore.create_resumed_run
@@ -253,6 +257,24 @@ async def test_engine_resume_from_tasks():
     assert rec.tasks["C"].result == "C-ok"  # preserved
     assert rec.tasks["B"].result == "b-v2"  # re-executed
     assert rec.tasks["D"].result == "d-v2"  # re-executed
+
+
+@pytest.mark.asyncio
+async def test_engine_resume_from_unknown_task_raises():
+    from flowrun.engine import Engine
+
+    registry = _build_diamond_registry()
+    state = StateStore()
+    state.create_run("old", "diamond", ["A", "B", "C", "D"])
+    for task_name in ["A", "B", "C", "D"]:
+        state.mark_running("old", task_name)
+        state.mark_success("old", task_name, f"{task_name}-ok")
+
+    scheduler = Scheduler(registry, state, cast(TaskExecutor, DummyExecutor({})), SchedulerConfig(max_parallel=4))
+    engine = Engine(registry, state, scheduler)
+
+    with pytest.raises(ValueError, match="not in the DAG"):
+        await engine.resume("old", from_tasks=["NOPE"])
 
 
 # ---------------------------------------------------------------------------

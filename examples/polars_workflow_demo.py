@@ -12,7 +12,7 @@ import polars as pl
 from pandera.errors import SchemaErrors
 from pandera.typing.polars import DataFrame, Series
 
-from flowrun import RunContext, build_default_engine, fn_hook
+from flowrun import Pipeline, RunContext, fn_hook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(name)-22s  %(levelname)-7s  %(message)s")
 logger = logging.getLogger("polars_workflow_demo")
@@ -25,8 +25,7 @@ polars_hook = fn_hook(
     on_dag_end=lambda e: print(f"[hook] DAG {e.dag_name} finished  run_id={e.run_id}"),
 )
 
-engine = build_default_engine(max_workers=4, max_parallel=3, logger=logger, hooks=[polars_hook])
-etl = engine.dag("polars_workflow_demo")
+pipeline = Pipeline("polars_workflow_demo", max_workers=4, max_parallel=3, logger=logger, hooks=[polars_hook])
 
 
 @dataclass(frozen=True)
@@ -250,69 +249,69 @@ def fake_quarantine_sink(rejected_df: pl.DataFrame, *, quarantine_name: str) -> 
 
 # Task names default to the function name. Pass name="users_extract_v2" only
 # when you want a task name that differs from the Python symbol.
-@etl.task(timeout_s=3.0)
+@pipeline.task(timeout_s=3.0)
 async def fetch_users_raw(context: RunContext[ApiDeps]) -> list[UserRecord]:
     """Thin orchestration wrapper for the users endpoint."""
     return await fetch_users_records(api_base=context.api_base, auth_token=context.auth_token)
 
 
-@etl.task(timeout_s=3.0)
+@pipeline.task(timeout_s=3.0)
 async def fetch_orders_raw(context: RunContext[ApiDeps]) -> list[OrderRecord]:
     """Thin orchestration wrapper for the orders endpoint."""
     return await fetch_orders_records(api_base=context.api_base, auth_token=context.auth_token)
 
 
 # Users branch: infer dependency edges from required parameter names.
-@etl.task()
+@pipeline.task()
 def prepare_users(fetch_users_raw: list[UserRecord]) -> pl.DataFrame:
     """Thin orchestration wrapper around the users normalisation function."""
     return normalize_users(fetch_users_raw)
 
 
-@etl.task()
+@pipeline.task()
 def validate_users(prepare_users: pl.DataFrame) -> ValidationSplit[UsersSchema]:
     """Thin orchestration wrapper around the users schema validation function."""
     return validate_frame(prepare_users, UsersSchema, business_object="users")
 
 
-@etl.task()
+@pipeline.task()
 def active_users(validate_users: ValidationSplit[UsersSchema]) -> DataFrame[ActiveUsersSchema]:
     """Thin orchestration wrapper around the active-users filter."""
     return select_active_users(validate_users.validated)
 
 
-@etl.task()
+@pipeline.task()
 def quarantine_users(validate_users: ValidationSplit[UsersSchema]) -> str:
     """Thin orchestration wrapper around the users quarantine sink."""
     return fake_quarantine_sink(validate_users.rejected, quarantine_name="users")
 
 
 # Orders branch: keep explicit deps when you want graph edges declared in the decorator.
-@etl.task(deps=[fetch_orders_raw])
+@pipeline.task(deps=[fetch_orders_raw])
 def prepare_orders(fetch_orders_raw: list[OrderRecord]) -> pl.DataFrame:
     """Thin orchestration wrapper around the orders normalisation function."""
     return normalize_orders(fetch_orders_raw)
 
 
-@etl.task(deps=[prepare_orders])
+@pipeline.task(deps=[prepare_orders])
 def validate_orders(prepare_orders: pl.DataFrame) -> ValidationSplit[OrdersSchema]:
     """Thin orchestration wrapper around the orders schema validation function."""
     return validate_frame(prepare_orders, OrdersSchema, business_object="orders")
 
 
-@etl.task(deps=[validate_orders])
+@pipeline.task(deps=[validate_orders])
 def paid_orders(validate_orders: ValidationSplit[OrdersSchema]) -> DataFrame[PaidOrdersSchema]:
     """Thin orchestration wrapper around the paid-orders filter."""
     return select_paid_orders(validate_orders.validated)
 
 
-@etl.task(deps=[validate_orders])
+@pipeline.task(deps=[validate_orders])
 def quarantine_orders(validate_orders: ValidationSplit[OrdersSchema]) -> str:
     """Thin orchestration wrapper around the orders quarantine sink."""
     return fake_quarantine_sink(validate_orders.rejected, quarantine_name="orders")
 
 
-@etl.task(deps=[active_users, paid_orders])
+@pipeline.task(deps=[active_users, paid_orders])
 def build_summary(
     active_users: DataFrame[ActiveUsersSchema],
     paid_orders: DataFrame[PaidOrdersSchema],
@@ -321,7 +320,7 @@ def build_summary(
     return build_sales_summary(active_users, paid_orders)
 
 
-@etl.task(deps=[build_summary])
+@pipeline.task(deps=[build_summary])
 def sink_summary(build_summary: DataFrame[SalesSummarySchema]) -> str:
     """Thin orchestration wrapper around the sink function."""
     return fake_sink(build_summary)
@@ -336,11 +335,10 @@ async def main() -> None:
         batch_date=str(date.today()),
     )
 
-    async with engine:
-        etl.validate()
-        print(etl.display())
-        run_id = await etl.run_once(context=context)
-        report = engine.get_run_report(run_id)
+    async with pipeline:
+        print(pipeline.display())
+        run_id = await pipeline.run_once(context=context)
+        report = pipeline.get_run_report(run_id)
 
     print("\n=== FINAL SUMMARY ===")
     print(report["tasks"]["build_summary"]["result"])

@@ -6,9 +6,10 @@ from types import TracebackType
 from typing import Any, Self
 
 from flowrun.context import RunContext
-from flowrun.dag import DAGBuilder
+from flowrun.dag import DAG, DAGBuilder
 from flowrun.executor import TaskExecutor
 from flowrun.hooks import RunHook
+from flowrun.pipeline import Pipeline
 from flowrun.scheduler import Scheduler, SchedulerConfig
 from flowrun.state import RunRecord, StateStore
 from flowrun.task import TaskRegistry
@@ -89,6 +90,10 @@ class DagScope:
     def list_tasks(self) -> list[str]:
         """List tasks in topological order for this DAG."""
         return self._engine.list_tasks(self._dag_name)
+
+    def build(self) -> Pipeline:
+        """Build this DAG into an executable pipeline snapshot."""
+        return self._engine.build(self._dag_name)
 
 
 class Engine:
@@ -180,7 +185,7 @@ class Engine:
         """
         dag = self._dag_builder.build(dag_name=dag_name)
         self._log.info("Starting DAG %r", dag_name)
-        run_id = await self._scheduler.run_dag_once(dag, context)
+        run_id = await self._run_built_dag(dag, context=context)
         self._log.info("Finished DAG %r  run_id=%s", dag_name, run_id)
         return run_id
 
@@ -255,7 +260,7 @@ class Engine:
             new_run_id,
             sorted(reset_tasks) if reset_tasks else "(failed/skipped only)",
         )
-        await self._scheduler.run_dag_once(dag, context, run_id=new_run_id)
+        await self._run_built_dag(dag, context=context, run_id=new_run_id)
         self._log.info("Finished resumed DAG %r  run_id=%s", prev.dag_name, new_run_id)
         return new_run_id
 
@@ -290,7 +295,7 @@ class Engine:
             targets,
             sub_dag.nodes,
         )
-        run_id = await self._scheduler.run_dag_once(sub_dag, context)
+        run_id = await self._run_built_dag(sub_dag, context=context)
         self._log.info("Finished sub-DAG %r  run_id=%s", dag_name, run_id)
         return run_id
 
@@ -309,7 +314,9 @@ class Engine:
             The ASCII tree representation (also printed to stdout).
         """
         dag = self._dag_builder.build(dag_name=dag_name)
+        return self._render_dag(dag)
 
+    def _render_dag(self, dag: DAG) -> str:
         # Build adjacency mapping from a task to the tasks that depend on it.
         dependents: dict[str, list[str]] = {node: [] for node in dag.nodes}
         for child, parents in dag.edges.items():
@@ -348,6 +355,33 @@ class Engine:
 
         return "\n".join(lines)
 
+    def _copy_registry_for_nodes(
+        self,
+        task_names: list[str],
+        source: TaskRegistry | None = None,
+        dag_name: str | None = None,
+    ) -> TaskRegistry:
+        registry = TaskRegistry()
+        source_registry = self._registry if source is None else source
+        for task_name in task_names:
+            registry.register(source_registry.get(task_name, dag_name))
+        return registry
+
+    async def _run_built_dag(
+        self,
+        dag: DAG,
+        *,
+        context: RunContext[Any] | None = None,
+        registry: TaskRegistry | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        scheduler = (
+            self._scheduler
+            if registry is None or registry is self._registry
+            else self._scheduler.clone_with_registry(registry)
+        )
+        return await scheduler.run_dag_once(dag, context, run_id=run_id)
+
     def validate(self, dag_name: str) -> None:
         """Validate a DAG definition without running it."""
         self._dag_builder.build(dag_name=dag_name)
@@ -364,6 +398,11 @@ class Engine:
     def dag(self, dag_name: str) -> DagScope:
         """Return a DAG-scoped facade to avoid repeating ``dag=...``."""
         return DagScope(self, dag_name)
+
+    def build(self, dag_name: str) -> Pipeline:
+        """Build a DAG into an executable pipeline snapshot."""
+        dag = self._dag_builder.build(dag_name=dag_name)
+        return Pipeline._from_built(self, dag, self._copy_registry_for_nodes(dag.nodes, dag_name=dag.name))
 
     def get_run_report(self, run_id: str) -> dict[str, Any]:
         """
@@ -394,6 +433,8 @@ class Engine:
     @staticmethod
     def _compute_run_status(rec: RunRecord) -> str:
         statuses = [task.status for task in rec.tasks.values()]
+        if not statuses and rec.finished_at is not None:
+            return "SUCCESS"
         if any(status in ("FAILED", "SKIPPED") for status in statuses):
             return "FAILED"
         if statuses and all(status == "SUCCESS" for status in statuses):

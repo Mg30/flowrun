@@ -1,42 +1,24 @@
 flowrun
 =======
 
-`flowrun` is a compact DAG execution engine for small to medium ETL jobs.
-It is designed for local, code-first workflows such as API ingest -> Polars transform
--> validation/quarantine -> sink, plus sequential micro-batch data sync jobs.
+`flowrun` is a compact, dependency-free DAG execution engine for local ETL and
+micro-batch workflows.
+
+It is designed for code-first jobs that live inside one Python process:
+
+- API ingest -> transform -> validate/quarantine -> sink
+- small to medium DAGs declared in Python
+- sequential micro-batch runs driven by external chunk sources
 
 Core ideas:
 
-- Keep orchestration simple: declare tasks + dependencies, run a DAG.
-- Keep runtime dependency-free: stdlib-based implementation.
-- Keep behavior explicit: retries, timeouts, skip semantics, run reports.
+- Keep orchestration small: declare tasks, wire dependencies, run a DAG.
+- Keep runtime light: stdlib-only core.
+- Keep behavior explicit: retries, async timeouts, run reports, resume, subgraphs.
 
-## Positioning
-
-`flowrun` is a good fit when your workflow lives inside one Python process,
-the DAG is declared in code, and you want a small execution layer around ETL
-functions rather than a full workflow platform.
-
-It is not positioned as a durable scheduler, distributed orchestrator, or
-policy-heavy control plane. If you need persistent workers, cron scheduling,
-cross-process recovery guarantees, dynamic scaling, or extensive execution
-policies, you should use a heavier system.
-
-## Strengths
-
-- Clear fit for API -> transform -> validate -> load pipelines.
-- Works well with Polars-style business logic and thin orchestration wrappers.
-- Small API surface and low operational overhead.
-- Explicit execution model: retries, DAG validation, run reports, hooks, resume, and subgraph runs.
-- Good match for sequential micro-batch jobs where context such as `batch_id`, `source`, or `window` matters.
-
-## Tradeoffs
-
-- In-process execution only; no distributed workers or durable queueing.
-- No built-in scheduling layer; run triggering belongs outside the framework.
-- Recovery is scoped to stored run state in the current process, not a full external orchestration backend.
-- Retry behavior is intentionally simple; API-specific backoff and resilience policies belong in user code.
-- Best for low-to-moderate workflow complexity, not platform-scale orchestration.
+`flowrun` is not a durable scheduler, distributed worker system, queue, or
+control plane. If you need persistent workers, cron scheduling, cross-process
+recovery guarantees, or dynamic scaling, use a heavier orchestrator.
 
 ## Installation
 
@@ -50,13 +32,11 @@ Optional example dependencies:
 pip install "flowrun-dag[examples]"
 ```
 
-This installs the libraries used by the example workflows, including Polars and
-Pandera's Polars integration.
+The import name stays `flowrun`:
 
-> The import name remains `flowrun`:
-> ```python
-> import flowrun
-> ```
+```python
+import flowrun
+```
 
 For development:
 
@@ -70,13 +50,22 @@ uv run pytest -q
 
 ## Quick Start
 
+The main flow is:
+
+1. Create a `Pipeline`.
+2. Register tasks on it.
+3. Run the pipeline.
+
 ```python
+from __future__ import annotations
+
 import asyncio
 from dataclasses import dataclass
 
-from flowrun import RunContext, build_default_engine
+from flowrun import Pipeline, RunContext
 
-engine = build_default_engine(max_workers=4, max_parallel=3)
+
+pipeline = Pipeline("daily_etl", max_workers=4, max_parallel=3)
 
 
 @dataclass(frozen=True)
@@ -84,57 +73,52 @@ class Deps:
     source_path: str
 
 
-# Task names default to the Python function name. Use name="daily_extract"
-# only when you need an explicit alias or a stable external task name.
-@engine.task(dag="daily_etl")
-def extract(context: RunContext[Deps]) -> list[dict]:
-    # In real jobs, read from file/API/db
+@pipeline.task()
+def extract(context: RunContext[Deps]) -> list[dict[str, int]]:
     return [{"id": 1, "amount": 10}, {"id": 2, "amount": 15}]
 
 
-@engine.task(dag="daily_etl", deps=[extract])
-def transform(extract: list[dict]) -> dict[str, int]:
-    total = sum(row["amount"] for row in extract)
-    return {"rows": len(extract), "total": total}
+@pipeline.task(deps=[extract])
+def transform(extract: list[dict[str, int]]) -> dict[str, int]:
+    return {
+        "rows": len(extract),
+        "total": sum(row["amount"] for row in extract),
+    }
 
 
-@engine.task(dag="daily_etl", deps=[transform])
-def load(transform: dict[str, int]) -> str:
-    # Persist results
-    return f"loaded rows={transform['rows']} total={transform['total']}"
+@pipeline.task(deps=[transform])
+def load(transform: dict[str, int], context: RunContext[Deps]) -> str:
+    return f"loaded {transform['rows']} rows from {context.source_path}"
 
 
 async def main() -> None:
-    ctx = RunContext(Deps(source_path="/tmp/data.json"))
-    async with engine:
-        engine.validate("daily_etl")
-        run_id = await engine.run_once("daily_etl", context=ctx)
-        report = engine.get_run_report(run_id)
-        print(report["status"])  # SUCCESS | FAILED | RUNNING
+    context = RunContext(Deps(source_path="/tmp/orders.json")).with_metadata(
+        source="orders",
+        batch_id="2026-05-28",
+    )
+
+    async with pipeline:
+        run_id = await pipeline.run_once(context=context)
+        report = pipeline.get_run_report(run_id)
+        print(report["status"])
+        print(report["tasks"]["load"]["result"])
 
 
 asyncio.run(main())
 ```
 
-## Concepts
+## What To Use
 
-- Task: Python callable registered with `@engine.task(...)`.
-- DAG: namespace (`dag="name"`) plus dependency edges between tasks.
-- Run: one execution instance of a DAG (`run_id`).
-- State store: tracks run/task status, timing, errors, and results.
+### `Pipeline`
 
-Task status lifecycle:
+`Pipeline` is the public authoring and execution API. It owns one named DAG and
+the runtime resources needed to execute it.
 
-- `PENDING -> RUNNING -> SUCCESS`
-- `PENDING -> RUNNING -> FAILED -> PENDING` (retry path)
-- `PENDING -> SKIPPED` (blocked by failed upstream)
-
-## API Guide
-
-### `build_default_engine(...)`
+Create one with:
 
 ```python
-engine = build_default_engine(
+pipeline = Pipeline(
+    "daily_etl",
     executor=None,
     max_workers=8,
     max_parallel=4,
@@ -144,257 +128,358 @@ engine = build_default_engine(
 )
 ```
 
-Parameters:
-
-- `executor`: optional `concurrent.futures.Executor` for sync tasks.
-- `max_workers`: thread pool size if `executor` is not provided.
-- `max_parallel`: max concurrent scheduled tasks, must be `>= 1`.
-- `logger`: optional `logging.Logger` used across components.
-- `hooks`: optional list of `RunHook` handlers.
-- `state_store`: optional custom in-memory state store instance.
-
-Returns: configured `Engine`.
-
-### `Engine` methods
-
-Run control:
-
-- `await engine.run_once(dag_name, context=None) -> str`
-- `await engine.run_many(dag_name, contexts) -> list[str]`
-- `await engine.resume(run_id, from_tasks=None, context=None) -> str`
-- `await engine.run_subgraph(dag_name, targets, context=None) -> str`
-
-Validation and discovery:
-
-- `engine.validate(dag_name) -> None`
-- `engine.list_dags() -> list[str]`
-- `engine.list_tasks(dag_name) -> list[str]`
-- `engine.display_dag(dag_name) -> str`
-
-Reporting:
-
-- `engine.get_run_report(run_id) -> dict`
-
-Resource lifecycle:
-
-- `engine.close() -> None`
-- `async with engine:` closes owned thread pool on exit.
-
-### Task registration
-
-Preferred style (bound to engine registry):
+Register tasks directly on the pipeline:
 
 ```python
-@engine.task(name="task_a", dag="etl", deps=[...], retries=1)
-def task_a(...):
-    ...
+@pipeline.task()
+def extract() -> list[int]:
+    return [1, 2, 3]
+```
+
+Useful pipeline methods:
+
+- `pipeline.name`
+- `pipeline.task(...)`
+- `pipeline.tasks`
+- `pipeline.dependencies`
+- `pipeline.validate()`
+- `pipeline.display()`
+- `pipeline.list_tasks()`
+- `await pipeline.run_once(context=None)`
+- `await pipeline.run_many(contexts)`
+- `await pipeline.run_subgraph(targets, context=None)`
+- `await pipeline.resume(run_id, from_tasks=None, context=None)`
+- `pipeline.subgraph(targets)`
+- `pipeline.get_run_report(run_id)`
+- `pipeline.override_tasks(...)`
+
+## Task Registration
+
+Tasks are normal Python callables.
+
+```python
+@pipeline.task(name="extract_orders", retries=2, timeout_s=10.0)
+async def extract_orders(context: RunContext[Deps]) -> list[dict]:
+    return await fetch_orders(context.api_base)
 ```
 
 Arguments:
 
-- `name`: optional, defaults to function name.
-- `dag`: DAG namespace for selection via `run_once(dag_name)`.
-- `deps`: optional list of task names or decorated task callables. When omitted,
-  required parameter names that match already-registered task names are inferred.
-- `timeout_s`: per-attempt timeout for async tasks (`None` disables timeout).
-- `retries`: retry count after failures.
+- `name`: optional, defaults to the function name.
+- `deps`: optional dependency list using task names or decorated task callables.
+- `timeout_s`: per-attempt timeout for async tasks only.
+- `retries`: retry count after the first failed attempt.
 
-For synchronous tasks, configure timeouts in the client you call inside the task.
-`flowrun` intentionally rejects framework-level timeouts for sync callables because
-thread-based timeouts cannot safely stop side effects.
-
-Use explicit `deps=` when you need `upstream`, dependency aliases, non-identifier
-task names, or forward references to tasks registered later.
-
-Avoid repeating `dag=...` with a DAG-scoped container:
+If `deps` is omitted, required parameter names that match already-registered
+task names are inferred.
 
 ```python
-etl = engine.dag("daily_etl")
-
-@etl.task(name="extract")
+@pipeline.task()
 def extract() -> list[int]:
     return [1, 2, 3]
 
-@etl.task(name="sum_values")
+
+@pipeline.task()
 def sum_values(extract: list[int]) -> int:
     return sum(extract)
-
-run_id = await etl.run_once()
 ```
 
-Available on the scope:
-
-- `etl.task(...)`
-- `await etl.run_once(context=None)`
-- `await etl.run_many(contexts)`
-- `await etl.run_subgraph(targets, context=None)`
-- `etl.validate()`, `etl.display()`, `etl.list_tasks()`
-
-### Dependency result injection
-
-Named dependency injection with inferred dependencies:
+Use explicit `deps=` when you want clearer edges, aliases, non-identifier task
+names, or forward references.
 
 ```python
-@engine.task(name="extract", dag="etl")
+@pipeline.task(name="sum_values", deps=[extract])
+def total(extract: list[int]) -> int:
+    return sum(extract)
+```
+
+### DAG-local task names
+
+Task names must be unique within one DAG namespace. Different DAGs may reuse
+natural names such as `extract`, `transform`, and `load`.
+
+```python
+users = Pipeline("users")
+orders = Pipeline("orders")
+
+
+@users.task(name="extract")
+def extract_users() -> list[str]:
+    return ["ada"]
+
+
+@orders.task(name="extract")
+def extract_orders() -> list[int]:
+    return [1]
+```
+
+### Multi-module applications
+
+Flowrun does not use an ambient "current DAG" or a process-wide task registry.
+Tasks register when their decorators run, so a package split across modules
+should choose one explicit registration point for each workflow.
+
+For small to medium applications, export the pipeline-bound task decorator from a
+runtime module and import it where tasks are defined:
+
+```text
+src/acme_etl/
+    workflows/
+        sales/
+            runtime.py
+            extract.py
+            transform.py
+            load.py
+            run.py
+```
+
+```python
+# workflows/sales/runtime.py
+from flowrun import Pipeline
+
+
+pipeline = Pipeline("sales", max_workers=4, max_parallel=3)
+task = pipeline.task
+```
+
+```python
+# workflows/sales/extract.py
+from .runtime import task
+
+
+@task()
+def extract_orders() -> list[dict[str, int]]:
+    return [{"id": 1, "amount": 10}]
+```
+
+```python
+# workflows/sales/transform.py
+from .runtime import task
+
+
+@task(deps=["extract_orders"])
+def summarize_orders(extract_orders: list[dict[str, int]]) -> dict[str, int]:
+    return {
+        "rows": len(extract_orders),
+        "total": sum(row["amount"] for row in extract_orders),
+    }
+```
+
+Make sure the task modules are imported before building or running the DAG:
+
+```python
+# workflows/sales/run.py
+import asyncio
+
+from . import extract, load, transform  # noqa: F401
+from .runtime import pipeline
+
+
+async def main() -> None:
+    async with pipeline:
+        run_id = await pipeline.run_once()
+        print(pipeline.get_run_report(run_id)["status"])
+
+
+asyncio.run(main())
+```
+
+For larger applications or tests that need a fresh pipeline, prefer explicit
+registration functions. This avoids import-time side effects in task modules and
+makes composition easier to control:
+
+```python
+# workflows/sales/users.py
+def register(task):
+    @task(name="extract_users")
+    def extract_users() -> list[str]:
+        return ["ada"]
+```
+
+```python
+# workflows/sales/build.py
+from flowrun import Pipeline
+
+from . import orders, users
+
+
+def build_sales_pipeline():
+    pipeline = Pipeline("sales", max_workers=4, max_parallel=3)
+
+    users.register(pipeline.task)
+    orders.register(pipeline.task)
+
+    return pipeline
+```
+
+In multi-module workflows, prefer explicit string dependencies for edges that
+cross module boundaries. Inferred dependencies only see tasks that have already
+registered, and callable dependencies can create import cycles between task
+modules.
+
+## Dependency Injection
+
+Flowrun supports two dependency-result styles.
+
+### Named dependency parameters
+
+```python
+@pipeline.task()
 def extract() -> list[int]:
     return [1, 2, 3]
 
-@engine.task(name="sum_values", dag="etl")
+
+@pipeline.task()
 def sum_values(extract: list[int]) -> int:
     return sum(extract)
 ```
 
-Explicit dependencies remain available when you prefer the edges in the decorator:
+### Generic `upstream`
 
 ```python
-@engine.task(name="sum_values", dag="etl", deps=[extract])
-def sum_values(extract: list[int]) -> int:
-    return sum(extract)
+@pipeline.task(deps=["users", "orders"])
+def combine(upstream: dict[str, object]) -> tuple[object, object]:
+    return upstream["users"], upstream["orders"]
 ```
 
-Generic `upstream` injection:
+If `upstream` is declared, named dependency injection is disabled for that task.
+
+## `RunContext`
+
+`RunContext` carries typed runtime dependencies and optional reporting metadata.
 
 ```python
-@engine.task(name="combine", dag="etl", deps=["a", "b"])
-def combine(upstream: dict[str, object]) -> object:
-    return (upstream["a"], upstream["b"])
-```
-
-If `upstream` is declared, named dependency injection is disabled.
-
-### Context injection
-
-Tasks can accept a typed `RunContext[...]` as a positional parameter.
-
-```python
-@dataclass(frozen=True)
-class Deps:
-    api_base: str
-
-@engine.task(name="pull", dag="etl")
+@pipeline.task()
 def pull(context: RunContext[Deps]) -> dict:
     return {"base": context.api_base}
 ```
 
-`RunContext` can also carry an ambient deadline or cancellation event when a task
-needs to pass timeouts into a client or stop cooperatively at a safe checkpoint.
+It also works alongside dependency-result parameters:
 
 ```python
-import threading
-
-cancel_event = threading.Event()
-ctx = RunContext(Deps(api_base="https://api.example.com"))
-ctx = ctx.with_deadline_s(30.0).with_cancel_event(cancel_event)
-
-@engine.task(name="pull", dag="etl")
-def pull(context: RunContext[Deps]) -> dict:
-    context.raise_if_cancelled()
-    timeout_s = context.time_remaining_s() or 10.0
-    return call_api(context.api_base, timeout=timeout_s)
+@pipeline.task(deps=[transform])
+def load(transform: dict, context: RunContext[Deps]) -> str:
+    return write_rows(context.sink_path, transform)
 ```
 
-This is optional. Most tasks do not need these helpers.
+Flowrun resolves normal and postponed annotations, so
+`from __future__ import annotations` works.
 
 ### Run metadata
 
-Attach lightweight reporting metadata to a run through `RunContext`.
-
 ```python
-ctx = RunContext(Deps(api_base="https://api.example.com")).with_metadata(
+context = RunContext(deps).with_metadata(
     batch_id=42,
     source="users_api",
-    window="2026-04-01",
 )
-
-run_id = await engine.run_once("etl", context=ctx)
-report = engine.get_run_report(run_id)
-print(report["metadata"])  # {"batch_id": 42, "source": "users_api", ...}
 ```
 
-This is useful for ETL-style identifiers such as batch ids, partitions, sources,
-or time windows without adding more orchestration parameters.
+Metadata is stored in the run report without adding more orchestration
+parameters to every task.
 
-## Execution Semantics
+### Deadlines and cooperative cancellation
 
-### DAG scoping and unknown DAG behavior
+```python
+@pipeline.task(timeout_s=30.0)
+async def pull(context: RunContext[Deps]) -> list[dict]:
+    context.raise_if_cancelled()
+    timeout_s = context.time_remaining_s() or 10.0
+    return await call_api(context.api_base, timeout=timeout_s)
+```
 
-- If tasks use explicit `dag=...` namespaces, unknown DAG names raise `ValueError`.
-- Error messages include available DAG names and a close-match suggestion.
-- Legacy behavior remains for unscoped registries (single implicit DAG).
+Synchronous tasks cannot use framework-level `timeout_s`; configure timeouts in
+the client or library you call inside the task.
 
-### Dependency validation
+## Run Reports
 
-Build-time validation catches:
-
-- Missing dependencies.
-- Cross-DAG dependencies.
-- Cycles.
-- Required task parameters that do not match an inferred or explicit dependency, `RunContext`, or `upstream`.
-
-Missing dependency errors include close-match suggestions when available.
-
-### Retries
-
-- Retries are per task and per run attempt.
-- Downstream tasks are skipped only after upstream retries are exhausted.
-
-### Timeouts
-
-- Applied per attempt for async tasks.
-- Async tasks use `asyncio.wait_for`.
-- Sync tasks do not support framework-level timeouts; use client/library timeouts inside the task.
-
-## Run Report Format
-
-`engine.get_run_report(run_id)` returns:
+`pipeline.get_run_report(run_id)` returns a
+plain dictionary:
 
 ```python
 {
-  "run_id": "...",
-  "dag_name": "...",
-  "metadata": {"batch_id": 42, "source": "users_api"},
-  "created_at": 0.0,
-  "finished_at": 0.0,
-  "status": "SUCCESS",  # SUCCESS | FAILED | RUNNING
-  "tasks": {
-    "task_name": {
-      "status": "SUCCESS",
-      "attempt": 1,
-      "started_at": 0.0,
-      "finished_at": 0.0,
-      "error": None,
-      "result": {...}
-    }
-  }
+    "run_id": "...",
+    "dag_name": "etl",
+    "metadata": {"batch_id": 42},
+    "created_at": 0.0,
+    "finished_at": 0.0,
+    "status": "SUCCESS",
+    "tasks": {
+        "extract": {
+            "status": "SUCCESS",
+            "attempt": 1,
+            "started_at": 0.0,
+            "finished_at": 0.0,
+            "error": None,
+            "result": [],
+        }
+    },
 }
 ```
 
 Run-level status rules:
 
-- `FAILED` if any task is `FAILED` or `SKIPPED`.
-- `SUCCESS` if all tasks are `SUCCESS`.
-- `RUNNING` otherwise.
+- `SUCCESS` when all tasks are `SUCCESS`
+- `FAILED` when any task is `FAILED` or `SKIPPED`
+- `RUNNING` otherwise
+
+## Resume And Subgraphs
+
+Run only one target branch and its transitive dependencies:
+
+```python
+run_id = await pipeline.run_subgraph(["load"], context=context)
+```
+
+Resume a previous run while preserving successful upstream tasks:
+
+```python
+new_run_id = await pipeline.resume(old_run_id, context=context)
+```
+
+Resume from a checkpoint task and all downstream dependents:
+
+```python
+new_run_id = await pipeline.resume(
+    old_run_id,
+    from_tasks=["transform"],
+    context=context,
+)
+```
+
+Unknown checkpoint names raise `ValueError`.
+
+## Pipeline Overrides For Tests
+
+Use `Pipeline.override_tasks(...)` to replace selected task implementations while
+keeping the original graph.
+
+```python
+test_pipeline = pipeline.override_tasks(
+    extract=[{"id": 1, "amount": 10}],
+)
+
+run_id = await test_pipeline.run_once(context=context)
+report = test_pipeline.get_run_report(run_id)
+```
+
+Override values may be constants or callables.
 
 ## Hooks
 
-Use hooks to emit metrics, alerts, or tracing signals.
+Hooks are small synchronous callbacks for alerts, metrics, and tracing. Hook
+errors are caught and logged so they do not crash a run.
 
 ```python
-from flowrun import fn_hook, build_default_engine
+from flowrun import Pipeline, fn_hook
+
 
 hook = fn_hook(
-    on_task_failure=lambda e: print(f"FAIL {e.task_name}: {e.error}"),
-    on_dag_end=lambda e: print(f"DAG done: {e.dag_name}"),
+    on_task_failure=lambda event: print(f"FAIL {event.task_name}: {event.error}"),
+    on_dag_end=lambda event: print(f"DONE {event.dag_name}"),
 )
 
-engine = build_default_engine(hooks=[hook])
+pipeline = Pipeline("etl", hooks=[hook])
 ```
-
-Hook API:
-
-- `RunHook` class with overridable methods.
-- `fn_hook(...)` for function-based handlers.
-- Hook errors are caught and logged (do not crash runs).
 
 Events:
 
@@ -402,60 +487,20 @@ Events:
 - `TaskStartEvent`, `TaskSuccessEvent`, `TaskFailureEvent`
 - `TaskRetryEvent`, `TaskSkipEvent`
 
-## State Stores
+## Practical Patterns
 
-In-memory (default):
+### Small ETL
 
-- `StateStore` / `InMemoryStateStore`
-- Fast, process-local, ephemeral.
+- Keep task wrappers thin.
+- Put business logic in normal functions that can be unit tested directly.
+- Use retries on flaky IO tasks, not pure transforms.
+- Keep `max_parallel` modest for predictable local resource use.
 
-## Practical ETL Patterns
+### Sequential micro-batches
 
-### Small Polars pipeline pattern
-
-- Keep each task focused (`extract`, `transform`, `load`).
-- Use `retries` on flaky IO tasks, not pure transforms.
-- Keep `max_parallel` modest for predictable resource use.
-
-### Sequential micro-batch pattern
-
-When chunks are fetched outside the DAG, run the full DAG once per chunk in a
-sequential loop. This is a micro-batch pattern, not end-to-end streaming.
+Drive chunks from outside the DAG, then run the same pipeline once per chunk.
 
 ```python
-import asyncio
-from dataclasses import dataclass
-
-from flowrun import RunContext, build_default_engine
-
-engine = build_default_engine(max_workers=4, max_parallel=2)
-etl = engine.dag("users")
-
-
-@dataclass(frozen=True)
-class ChunkDeps:
-    chunk_index: int
-    rows: list[dict[str, int]]
-
-
-@etl.task()
-def input_chunk(context: RunContext[ChunkDeps]) -> list[dict[str, int]]:
-    return context.rows
-
-
-@etl.task(deps=[input_chunk])
-def transform_chunk(input_chunk: list[dict[str, int]]) -> dict[str, int]:
-    return {
-        "rows": len(input_chunk),
-        "total": sum(row["value"] for row in input_chunk),
-    }
-
-
-@etl.task(deps=[transform_chunk])
-def load_chunk(transform_chunk: dict[str, int]) -> str:
-    return f"loaded rows={transform_chunk['rows']} total={transform_chunk['total']}"
-
-
 async def chunk_contexts():
     for chunk_index in range(3):
         rows = [{"value": chunk_index * 10 + offset} for offset in range(3)]
@@ -465,83 +510,65 @@ async def chunk_contexts():
         )
 
 
-async def main() -> None:
-    async with engine:
-        etl.validate()
-        run_ids = await etl.run_many(chunk_contexts())
-        print(run_ids)
-
-
-asyncio.run(main())
+async with pipeline:
+    run_ids = await pipeline.run_many(chunk_contexts())
 ```
 
-This keeps chunk fetching outside the DAG while preserving plain task boundaries
-inside the graph.
+### Polars and validation
 
-### Layered Polars workflow pattern
+For Polars/Pandera workflows, keep the orchestration layer thin:
 
-For teams that need clearer structure, keep undecorated business functions in one
-layer and add a thin Flowrun orchestration layer on top.
-
-Recommended split:
-
-- async extraction functions that fetch raw endpoint payloads
-- pure Polars functions that normalise each dataset independently
-- Pandera validation functions that split validated and rejected rows
+- async extraction functions for raw payloads
+- pure Polars transform functions
+- validation functions that split accepted and rejected rows
 - quarantine sink functions for rejected rows
-- a pure join/aggregation function that combines the processed frames
-- a plain sink function
-- small task wrappers that call those functions and express orchestration only
+- a final join/aggregation function
+- thin Flowrun task wrappers that express orchestration only
 
-See `examples/polars_workflow_demo.py` for a concrete example with two fake API
-endpoints fetched in parallel, separate Polars processing branches, schema
-validation with quarantine, a join step, and a fake sink.
+See `examples/polars_workflow_demo.py` for a complete example.
 
-### Re-run from a checkpoint task
+## Validation Rules
 
-```python
-new_run_id = await engine.resume(old_run_id, from_tasks=["transform"], context=ctx)
-```
+Flowrun validates DAGs before execution and catches:
 
-This re-executes `transform` and all downstream tasks, while preserving unaffected successful upstream tasks.
+- empty DAGs
+- missing dependencies
+- cross-DAG dependencies
+- cycles
+- duplicate task names inside one DAG
+- required task parameters Flowrun cannot provide
+- unknown subgraph targets
+- unknown resume checkpoint tasks
 
-### Run only a target branch
+## Public API
 
-```python
-run_id = await engine.run_subgraph("daily_etl", targets=["load"], context=ctx)
-```
+Top-level exports from `flowrun`:
 
-This executes `load` plus all transitive dependencies required for `load`.
-
-## Logging
-
-Pass a logger to `build_default_engine(logger=...)`.
-
-Typical levels:
-
-- `INFO`: DAG start/finish, task success, retries, skips.
-- `WARNING`: task failures, timeouts.
-- `DEBUG`: task launch details, tracebacks, shutdown details.
-
-## Testing Your DAGs
-
-Recommended test layers:
-
-- Unit test each task function directly.
-- Integration test DAG execution with `build_default_engine()`.
-- Validate topology with `engine.validate(...)` and `engine.list_tasks(...)`.
-- Assert on `get_run_report(...)` for end-to-end behavior.
-
-## Public API Surface
-
-Top-level exports in `flowrun`:
-
-- `Engine`, `build_default_engine`
-- `RunContext`
+- `Pipeline`
+- `RunContext`, `RunCancelledError`
 - `TaskSpec`, `TaskRegistry`
 - `SchedulerConfig`
 - `RunHook`, `fn_hook`
 - `StateStore`, `InMemoryStateStore`
+
+The package includes `py.typed` for type checkers.
+
+## Logging
+
+Pass a logger to `Pipeline("name", logger=...)`.
+
+Typical levels:
+
+- `INFO`: DAG start/finish, task success, retries, skips
+- `WARNING`: task failures and timeouts
+- `DEBUG`: task launch details, tracebacks, shutdown details
+
+## Testing Your DAGs
+
+- Unit test business functions directly.
+- Build pipelines and assert `pipeline.tasks` / `pipeline.dependencies`.
+- Use `pipeline.override_tasks(...)` for controlled end-to-end tests.
+- Assert on `pipeline.get_run_report(run_id)` for run behavior.
 
 ## License
 

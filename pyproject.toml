@@ -1,6 +1,6 @@
 [project]
 name = "flowrun-dag"
-version = "1.0.0"
+version = "1.1.0"
 description = "A lightweight async DAG orchestrator for small to medium ETL pipelines"
 readme = "README.md"
 license = { text = "MIT" }
@@ -14,7 +14,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "Topic :: System :: Distributed Computing",
     "Typing :: Typed",
 ]
 
@@ -57,6 +56,9 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+flowrun = ["py.typed"]
 
 [build-system]
 requires = ["setuptools"]

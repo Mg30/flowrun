@@ -1,8 +1,9 @@
 import inspect
 import types
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Annotated, Any, get_args, get_origin
+from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 from flowrun.context import RunContext
 
@@ -22,9 +23,9 @@ class TaskSpec:
     timeout_s : float | None
         Timeout in seconds for async task execution, or None for no timeout.
     accepts_context : bool
-        True when the task function signature allows a positional RunContext argument.
+        True when the task function signature allows a RunContext argument.
     requires_context : bool
-        True when the task function signature requires a positional RunContext argument.
+        True when the task function signature requires a RunContext argument.
     accepts_upstream : bool
         True when the task function signature includes an ``upstream`` parameter to
         receive dependency results as a mapping.
@@ -49,6 +50,8 @@ class TaskSpec:
     dag: str | None = None
     accepts_context: bool = False
     requires_context: bool = False
+    context_param_name: str | None = None
+    context_positional_only: bool = False
     accepts_upstream: bool = False
     named_deps: list[str] = field(default_factory=list)
 
@@ -70,7 +73,7 @@ class TaskRegistry:
 
     def __init__(self) -> None:
         """Initialize an empty task registry."""
-        self._tasks: dict[str, TaskSpec] = {}
+        self._tasks: dict[tuple[str | None, str], TaskSpec] = {}
 
     # ---- collection protocol ----
 
@@ -80,14 +83,18 @@ class TaskRegistry:
         Raises
         ------
         ValueError
-            If a task with the same name is already registered.
+            If a task with the same name is already registered in the same DAG namespace.
         """
         _validate_task_spec(spec)
-        if spec.name in self._tasks:
-            raise ValueError(f"Duplicate task name: {spec.name!r}")
-        self._tasks[spec.name] = spec
+        key = (spec.dag, spec.name)
+        if key in self._tasks:
+            raise ValueError(
+                f"Duplicate task name {spec.name!r} in DAG {spec.dag!r}. "
+                "Task names must be unique within a DAG namespace."
+            )
+        self._tasks[key] = spec
 
-    def get(self, name: str) -> TaskSpec:
+    def get(self, name: str, dag: str | None = None) -> TaskSpec:
         """Fetch a previously registered task specification.
 
         Raises
@@ -95,14 +102,30 @@ class TaskRegistry:
         KeyError
             If no task with the given name is registered.
         """
-        try:
-            return self._tasks[name]
-        except KeyError:
+        if dag is not None:
+            if (dag, name) in self._tasks:
+                return self._tasks[(dag, name)]
+            if (None, name) in self._tasks:
+                return self._tasks[(None, name)]
+            raise KeyError(f"Task {name!r} is not registered in DAG {dag!r}") from None
+
+        matches = [spec for (task_dag, task_name), spec in self._tasks.items() if task_name == name]
+        if not matches:
             raise KeyError(f"Task {name!r} is not registered") from None
+        if len(matches) > 1:
+            dags = ", ".join(repr(spec.dag) for spec in matches)
+            raise KeyError(f"Task {name!r} is ambiguous across DAGs: {dags}. Pass dag=... to disambiguate.")
+        return matches[0]
+
+    def contains(self, name: str, dag: str | None = None) -> bool:
+        """Return True when *name* exists, optionally inside *dag*."""
+        if dag is not None:
+            return (dag, name) in self._tasks or (None, name) in self._tasks
+        return any(task_name == name for _task_dag, task_name in self._tasks)
 
     def __contains__(self, name: object) -> bool:
         """Check whether a task name is registered."""
-        return name in self._tasks
+        return isinstance(name, str) and self.contains(name)
 
     def __len__(self) -> int:
         """Return the number of registered tasks."""
@@ -110,7 +133,7 @@ class TaskRegistry:
 
     def __iter__(self) -> Iterator[str]:
         """Iterate over registered task names."""
-        return iter(self._tasks)
+        return (name for _dag, name in self._tasks)
 
     def __getitem__(self, name: str) -> TaskSpec:
         """Subscript access, delegates to `get()`."""
@@ -118,8 +141,22 @@ class TaskRegistry:
 
     @property
     def task_specs(self) -> Mapping[str, TaskSpec]:
-        """Read-only view of all registered task specifications."""
-        return types.MappingProxyType(self._tasks)
+        """Read-only view of registered task specifications.
+
+        Globally unique task names use their plain name. Names repeated across
+        DAGs use ``dag:name`` keys so every task remains visible.
+        """
+        counts = Counter(spec.name for spec in self._tasks.values())
+        visible: dict[str, TaskSpec] = {}
+        for spec in self._tasks.values():
+            key = spec.name if counts[spec.name] == 1 else f"{spec.dag}:{spec.name}"
+            visible[key] = spec
+        return types.MappingProxyType(visible)
+
+    @property
+    def specs(self) -> tuple[TaskSpec, ...]:
+        """Return all task specs without changing their names."""
+        return tuple(self._tasks.values())
 
     def clear(self) -> None:
         """Remove all registered tasks. Primarily intended for testing."""
@@ -127,7 +164,7 @@ class TaskRegistry:
 
     def __repr__(self) -> str:
         """Return a human-readable representation of the registry."""
-        names = ", ".join(self._tasks)
+        names = ", ".join(spec.name if spec.dag is None else f"{spec.dag}:{spec.name}" for spec in self._tasks.values())
         return f"TaskRegistry([{names}])"
 
 
@@ -169,23 +206,42 @@ def _annotation_is_run_context(annotation: Any) -> bool:
     return False
 
 
-def _context_signature_flags(callable_obj: Callable[..., Any]) -> tuple[bool, bool]:
-    """Inspect a callable and return ``(accepts_context, requires_context)``.
+def _type_hints(callable_obj: Callable[..., Any]) -> dict[str, Any]:
+    """Resolve annotations when possible, including postponed annotations."""
+    try:
+        return get_type_hints(callable_obj, include_extras=True)
+    except Exception:
+        return {}
+
+
+def _param_annotation(param: inspect.Parameter, hints: Mapping[str, Any]) -> Any:
+    return hints.get(param.name, param.annotation)
+
+
+def _context_signature_flags(callable_obj: Callable[..., Any]) -> tuple[bool, bool, str | None, bool]:
+    """Inspect a callable and return context injection details.
 
     Detection relies **only** on type annotations — parameter names are not
     considered, avoiding false positives.
     """
     sig = inspect.signature(callable_obj)
+    hints = _type_hints(callable_obj)
     for param in sig.parameters.values():
         if param.kind in (
             inspect.Parameter.POSITIONAL_ONLY,
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
         ):
             if param.name in {"self", "cls"}:
                 continue
-            if _annotation_is_run_context(param.annotation):
-                return True, param.default is inspect._empty
-    return False, False
+            if _annotation_is_run_context(_param_annotation(param, hints)):
+                return (
+                    True,
+                    param.default is inspect._empty,
+                    param.name,
+                    param.kind is inspect.Parameter.POSITIONAL_ONLY,
+                )
+    return False, False, None, False
 
 
 def _accepts_upstream(callable_obj: Callable[..., Any]) -> bool:
@@ -203,9 +259,12 @@ def _accepts_upstream(callable_obj: Callable[..., Any]) -> bool:
     )
 
 
-def _infer_required_dep_names(callable_obj: Callable[..., Any], registry: TaskRegistry) -> list[str]:
+def _infer_required_dep_names(
+    callable_obj: Callable[..., Any], registry: TaskRegistry, dag: str | None = None
+) -> list[str]:
     """Infer dependency names from required parameters that match registered tasks."""
     sig = inspect.signature(callable_obj)
+    hints = _type_hints(callable_obj)
     inferred: list[str] = []
     for param in sig.parameters.values():
         if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
@@ -214,11 +273,11 @@ def _infer_required_dep_names(callable_obj: Callable[..., Any], registry: TaskRe
             continue
         if param.default is not inspect._empty:
             continue
-        if _annotation_is_run_context(param.annotation):
+        if _annotation_is_run_context(_param_annotation(param, hints)):
             continue
         if param.name == "upstream":
             continue
-        if param.name in registry:
+        if registry.contains(param.name, dag=dag):
             inferred.append(param.name)
     return inferred
 
@@ -242,6 +301,7 @@ def _accepted_named_deps(callable_obj: Callable[..., Any], dep_names: list[str])
 def _unsatisfied_required_params(callable_obj: Callable[..., Any], dep_names: Sequence[str]) -> list[str]:
     """Return required parameters that flowrun cannot satisfy for *callable_obj*."""
     sig = inspect.signature(callable_obj)
+    hints = _type_hints(callable_obj)
     unsatisfied: list[str] = []
     for param in sig.parameters.values():
         if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
@@ -250,7 +310,7 @@ def _unsatisfied_required_params(callable_obj: Callable[..., Any], dep_names: Se
             continue
         if param.default is not inspect._empty:
             continue
-        if _annotation_is_run_context(param.annotation):
+        if _annotation_is_run_context(_param_annotation(param, hints)):
             continue
         if param.name == "upstream":
             continue
@@ -306,17 +366,16 @@ def task(
     retries : int
         Number of times to retry on failure (0 = no retries).
     dag : str | None
-        Optional DAG namespace used by ``Engine.run_once(dag_name=...)`` to
-        select only tasks belonging to that DAG.
+        Optional DAG namespace used internally when a pipeline registers tasks.
     registry : TaskRegistry | None
         Registry to register with. Required when using ``task(...)`` directly.
     """
     if registry is None:
-        raise TypeError("task(...): registry= is required. Prefer engine.task(...) or etl.task(...).")
+        raise TypeError("task(...): registry= is required. Prefer pipeline.task(...).")
 
     def wrapper(func: Callable[..., Any]):
-        dep_names = _normalize_deps(deps) if deps is not None else _infer_required_dep_names(func, registry)
-        ctx_accepts, ctx_requires = _context_signature_flags(func)
+        dep_names = _normalize_deps(deps) if deps is not None else _infer_required_dep_names(func, registry, dag=dag)
+        ctx_accepts, ctx_requires, ctx_name, ctx_positional_only = _context_signature_flags(func)
         has_upstream = _accepts_upstream(func)
         named = [] if has_upstream else _accepted_named_deps(func, dep_names)
 
@@ -329,6 +388,8 @@ def task(
             dag=dag,
             accepts_context=ctx_accepts,
             requires_context=ctx_requires,
+            context_param_name=ctx_name,
+            context_positional_only=ctx_positional_only,
             accepts_upstream=has_upstream,
             named_deps=named,
         )

@@ -3,13 +3,12 @@ import logging
 from dataclasses import dataclass
 from typing import TypedDict
 
-from flowrun import RunContext, build_default_engine
+from flowrun import Pipeline, RunContext
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(name)-22s  %(levelname)-7s  %(message)s")
 logger = logging.getLogger("micro_batch_demo")
 
-engine = build_default_engine(max_workers=4, max_parallel=2, logger=logger)
-etl = engine.dag("micro_batch_demo")
+pipeline = Pipeline("micro_batch_demo", max_workers=4, max_parallel=2, logger=logger)
 
 
 @dataclass(frozen=True)
@@ -29,7 +28,7 @@ class InputChunkResult(TypedDict):
 
 # Task names default to the Python function name. Use name="chunk_input_v2"
 # only when you need an alias or a stable orchestration name during refactors.
-@etl.task()
+@pipeline.task()
 def input_chunk(context: RunContext[ChunkDeps]) -> InputChunkResult:
     """Expose the current chunk from the run context as normal task input."""
     return {
@@ -38,7 +37,7 @@ def input_chunk(context: RunContext[ChunkDeps]) -> InputChunkResult:
     }
 
 
-@etl.task(deps=[input_chunk])
+@pipeline.task(deps=[input_chunk])
 def transform_chunk(input_chunk: InputChunkResult) -> dict[str, int]:
     """Summarise the current chunk without knowing about orchestration."""
     rows = input_chunk["rows"]
@@ -50,7 +49,7 @@ def transform_chunk(input_chunk: InputChunkResult) -> dict[str, int]:
     }
 
 
-@etl.task(deps=[transform_chunk])
+@pipeline.task(deps=[transform_chunk])
 def load_chunk(transform_chunk: dict[str, int]) -> str:
     """Return a fake sink result for the processed chunk."""
     return (
@@ -71,13 +70,12 @@ async def fetch_chunk_contexts():
 
 async def main() -> None:
     """Run the same DAG once per chunk from the async source."""
-    async with engine:
-        etl.validate()
-        run_ids = await etl.run_many(fetch_chunk_contexts())
+    async with pipeline:
+        run_ids = await pipeline.run_many(fetch_chunk_contexts())
 
         print("=== MICRO-BATCH RUNS ===")
         for run_id in run_ids:
-            report = engine.get_run_report(run_id)
+            report = pipeline.get_run_report(run_id)
             batch_id = report["metadata"]["batch_id"]
             print(f"batch={batch_id}  {run_id}: {report['tasks']['load_chunk']['result']}")
 
