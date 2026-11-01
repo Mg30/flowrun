@@ -22,15 +22,25 @@ recovery guarantees, or dynamic scaling, use a heavier orchestrator.
 
 ## Installation
 
+Requires Python 3.12 or newer; CI runs on Python 3.12. Package metadata currently
+marks the project as **Alpha**.
+
+This README describes the **1.1.0 source API**, including `Pipeline`. The latest
+PyPI release is **1.0.0**, whose API uses `Engine` and `DagScope`. Install the
+source version to run the examples on this page:
+
 ```bash
-pip install flowrun-dag
+pip install 'flowrun-dag @ git+https://github.com/Mg30/flowrun.git@main'
 ```
 
 Optional example dependencies:
 
 ```bash
-pip install "flowrun-dag[examples]"
+pip install 'flowrun-dag[examples] @ git+https://github.com/Mg30/flowrun.git@main'
 ```
+
+For the published 1.0.0 API, use `pip install flowrun-dag==1.0.0` and follow the
+[README for that release](https://github.com/Mg30/flowrun/blob/v1.0.0/README.md).
 
 The import name stays `flowrun`:
 
